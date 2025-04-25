@@ -1,0 +1,194 @@
+/* edel-stripe-payment/css/front.css */
+
+/* --- 全体を囲むラッパー --- */
+.edel-stripe-payment-form-wrap {
+    background-color: #f9f9f9; /* 背景色を薄いグレーに */
+    border: 1px solid #e0e0e0; /* 境界線を少し薄く */
+    border-radius: 6px; /* 角を少し丸める */
+    padding: 30px; /* 内側の余白を少し広めに */
+    margin-top: 20px; /* 上下のマージン */
+    margin-bottom: 20px;
+    max-width: 500px; /* 最大幅は維持 */
+    margin-left: auto; /* 中央寄せにする場合（テーマによる） */
+    margin-right: auto;
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05); /* Subtle shadow */
+    box-sizing: border-box;
+}
+
+/* --- 見出し (商品名など) --- */
+.edel-stripe-payment-form-wrap h3 {
+    margin-top: 0; /* 上マージンをリセット */
+    margin-bottom: 10px;
+    font-size: 1.3em; /* 少し大きく */
+    font-weight: 600;
+    color: #333;
+    text-align: center; /* 中央寄せにする例 */
+}
+
+/* --- 金額表示 --- */
+.edel-stripe-payment-form-wrap p:first-of-type {
+    /* 金額表示の<p>を想定 */
+    text-align: center; /* 中央寄せにする例 */
+    font-size: 1.1em;
+    font-weight: bold;
+    color: #555;
+    margin-bottom: 25px;
+}
+
+/* --- フォーム要素の共通設定 --- */
+.edel-stripe-payment-form-wrap .form-row {
+    margin-bottom: 20px; /* 各入力欄の間のスペース */
+}
+
+.edel-stripe-payment-form-wrap label {
+    display: block;
+    margin-bottom: 8px; /* ラベルと入力欄のスペース */
+    font-weight: 600;
+    font-size: 0.95em;
+    color: #444;
+}
+
+/* --- 入力欄 (メール & Stripe Elementコンテナ) --- */
+.edel-stripe-payment-form-wrap .edel-stripe-email-input, /* ← IDからクラスへ */
+.edel-stripe-payment-form-wrap .edel-stripe-card-element {
+    /* ← IDからクラスへ */
+    display: block;
+    width: 100%;
+    padding: 12px 15px;
+    font-size: 1em;
+    color: #333;
+    background-color: #ffffff;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.07);
+    box-sizing: border-box;
+    transition: border-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+    height: 48px; /* 高さを固定 */
+}
+
+/* --- ★フォーカススタイル (クラスセレクタに変更 & :focus-within) --- */
+.edel-stripe-payment-form-wrap .edel-stripe-email-input:focus, /* ← IDからクラスへ */
+.edel-stripe-payment-form-wrap .edel-stripe-card-element:focus-within {
+    /* ← IDからクラスへ */
+    border-color: #0073aa;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.07), 0 0 0 2px rgba(0, 115, 170, 0.2);
+    outline: none;
+}
+
+/* --- ★カードエラー表示 (クラスセレクタに変更) --- */
+.edel-stripe-payment-form-wrap .edel-stripe-card-errors {
+    /* ← IDからクラスへ */
+    color: #dc3545;
+    margin-top: 8px;
+    font-size: 0.9em;
+    min-height: 1em;
+}
+
+/* --- ★送信ボタン (クラスセレクタに変更) --- */
+.edel-stripe-payment-form-wrap .edel-stripe-submit-button {
+    /* ← IDからクラスへ */
+    display: block;
+    width: 100%;
+    padding: 14px;
+    margin-top: 25px;
+    font-size: 1.1em;
+    font-weight: bold;
+    color: #ffffff;
+    background-color: #007cba;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    text-align: center;
+    transition: background-color 0.2s ease;
+}
+.edel-stripe-payment-form-wrap .edel-stripe-submit-button:hover:not(:disabled) {
+    background-color: #005a87;
+}
+.edel-stripe-payment-form-wrap .edel-stripe-submit-button:disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+}
+
+/* --- ★スピナー (クラスセレクタに変更) --- */
+/* .spinner または .spinner-sub クラスに適用される */
+.edel-stripe-payment-form-wrap .edel-stripe-spinner {
+    /* ← 共通クラスへ */
+    display: inline-block;
+    border: 3px solid #f3f3f3;
+    border-top: 3px solid #007cba;
+    border-radius: 50%;
+    width: 20px;
+    height: 20px;
+    animation: edel-stripe-spin 1s linear infinite;
+    margin-left: 10px;
+    vertical-align: middle;
+}
+@keyframes edel-stripe-spin {
+    /* (変更なし) */
+}
+
+/* --- ★同意チェックボックス関連 (クラスに変更) --- */
+/* 標準チェックボックス表示に戻したため、カスタムスタイルは削除済みのはず */
+/* 必要なら .privacy-consent, .edel-stripe-consent-label, .edel-stripe-consent-input, .edel-stripe-consent-error にスタイルを適用 */
+.edel-stripe-payment-form-wrap .privacy-consent {
+    margin-top: 20px;
+    margin-bottom: 20px; /* 他のform-rowに合わせる */
+    font-size: 0.95em; /* 他のラベル等と合わせる例 */
+    line-height: 1.6;
+}
+.edel-stripe-payment-form-wrap .edel-stripe-consent-label {
+    /* label */
+    /* display: flex などは不要（標準チェックボックスのため） */
+    cursor: pointer;
+}
+.edel-stripe-payment-form-wrap .edel-stripe-consent-input {
+    /* input[type=checkbox] */
+    margin-right: 8px; /* テキストとの間にスペース */
+    vertical-align: middle; /* テキストと垂直位置を合わせる */
+    width: 16px; /* 標準チェックボックスのサイズ調整（ブラウザ依存） */
+    height: 16px;
+}
+.edel-stripe-payment-form-wrap .edel-stripe-consent-error {
+    /* div */
+    /* margin-left: 24px; */ /* インデントは不要かも */
+    margin-top: 5px;
+    font-size: 0.9em;
+    color: red;
+    display: none; /* JSで制御 */
+}
+
+/* --- ★結果メッセージ表示エリア (クラスセレクタに変更) --- */
+.edel-stripe-payment-form-wrap .edel-stripe-result-message {
+    /* ← IDからクラスへ */
+    margin-top: 20px;
+    padding: 15px;
+    border-radius: 4px;
+    font-weight: bold;
+    white-space: pre-wrap;
+    font-size: 14px;
+    line-height: 22px;
+    border: 1px solid transparent;
+    text-align: left;
+}
+.edel-stripe-payment-form-wrap .edel-stripe-result-message:empty {
+    display: none;
+}
+/* 状態別スタイル (クラス指定はそのまま) */
+.edel-stripe-payment-form-wrap .edel-stripe-result-message.success {
+    /* ← セレクタ更新 */
+    color: #0f5132;
+    background-color: #d1e7dd;
+    border-color: #badbcc;
+}
+.edel-stripe-payment-form-wrap .edel-stripe-result-message.error {
+    /* ← セレクタ更新 */
+    color: #842029;
+    background-color: #f8d7da;
+    border-color: #f5c2c7;
+}
+.edel-stripe-payment-form-wrap .edel-stripe-result-message.info {
+    /* ← セレクタ更新 */
+    color: #055160;
+    background-color: #cff4fc;
+    border-color: #b6effb;
+}

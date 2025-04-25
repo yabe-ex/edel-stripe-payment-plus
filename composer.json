@@ -1,0 +1,19 @@
+{
+    "name": "edelherz/edel-stripe-payment",
+    "description": "Stripe Elementsを利用し、WordPressに安全なカード決済（買い切り＆サブスク）を導入。ショートコード設置、ユーザー連携、管理機能付き。",
+    "type": "wordpress-plugin",
+    "require": {
+        "php": ">=7.4",
+        "stripe/stripe-php": "^13.0"
+    },
+    "config": {
+        "platform": {
+            "php": "7.4"
+        }
+    },
+    "autoload": {
+        "psr-4": {
+            "EdelStripePayment\\": "inc/"
+        }
+    }
+}

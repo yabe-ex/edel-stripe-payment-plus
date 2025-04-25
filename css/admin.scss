@@ -1,0 +1,15 @@
+.setting-wrapper {
+    .key {
+        display: flex;
+        align-items: center;
+        label {
+            width: 120px;
+            text-align: right;
+            padding: 4px;
+        }
+        input {
+            margin-left: 10px;
+            width: calc(100% - 120px);
+        }
+    }
+}

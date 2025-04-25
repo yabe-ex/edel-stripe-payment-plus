@@ -1,0 +1,24 @@
+.edel-stripe-settings .nav-tab-wrapper {
+    margin-bottom: 20px;
+}
+
+/* Hide all tab content by default */
+.edel-stripe-settings .tab-content {
+    display: none;
+    margin-top: 20px;
+    padding-top: 10px;
+    border-top: 1px solid #ccc;
+}
+
+/* Show the active tab content */
+.edel-stripe-settings .tab-content.active-tab {
+    display: block;
+}
+
+/* Make copy button less intrusive */
+#edel-stripe-plan-list .button.copy-clipboard {
+    margin-left: 5px;
+    padding: 0px 6px; /* Make smaller */
+    line-height: 1.5;
+    height: auto;
+}
