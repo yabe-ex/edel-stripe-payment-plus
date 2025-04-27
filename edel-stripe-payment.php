@@ -129,10 +129,20 @@ class EdelStripePayment {
         add_filter('plugin_action_links_' . EDEL_STRIPE_PAYMENT_BASENAME, array($this->admin_instance, 'plugin_action_links'));
         add_action('admin_enqueue_scripts', array($this->admin_instance, 'admin_enqueue'));
 
+        $cancel_sub_action = 'edel_stripe_cancel_subscription';
+        add_action('wp_ajax_' . $cancel_sub_action, array($this->admin_instance, 'ajax_cancel_subscription'));
+        $sync_sub_action = 'edel_stripe_sync_subscription';
+        add_action('wp_ajax_' . $sync_sub_action, array($this->admin_instance, 'ajax_sync_subscription'));
+        $refund_action = 'edel_stripe_refund_payment';
+        add_action('wp_ajax_' . $refund_action, array($this->admin_instance, 'ajax_refund_payment'));
+        $refund_action = 'edel_stripe_refund_payment';
+        add_action('wp_ajax_' . $refund_action, array($this->admin_instance, 'ajax_refund_payment'));
+
         // フロントエンド側のフック登録
         add_action('wp_enqueue_scripts', array($this->front_instance, 'front_enqueue'));
         add_shortcode('stripe_onetime', array($this->front_instance, 'render_onetime_shortcode'));
         add_shortcode('edel_stripe_subscription', array($this->front_instance, 'render_subscription_shortcode'));
+        add_shortcode('edel_stripe_my_account', array($this->front_instance, 'render_my_account_page'));
 
         // AJAXハンドラー登録
         $ajax_action_name = 'edel_stripe_process_onetime';
@@ -146,6 +156,9 @@ class EdelStripePayment {
         $sub_action_name = 'edel_stripe_process_subscription'; // JSから送られる action 名
         add_action('wp_ajax_' . $sub_action_name, array($this->front_instance, 'process_subscription'));
         add_action('wp_ajax_nopriv_' . $sub_action_name, array($this->front_instance, 'process_subscription'));
+
+        $user_cancel_action = 'edel_stripe_user_cancel_subscription';
+        add_action('wp_ajax_' . $user_cancel_action, array($this->front_instance, 'ajax_user_cancel_subscription')); // ログインユーザー専用
 
         // REST API エンドポイント（Webhook用）の登録
         add_action('rest_api_init', array($this->front_instance, 'register_webhook_endpoint'));

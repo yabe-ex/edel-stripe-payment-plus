@@ -98,15 +98,15 @@ class EdelStripePaymentAdmin {
 ?>
         <div class="wrap">
             <h1>サブスクリプション履歴</h1>
-            <p>現在アクティブ（または登録時アクティブ/トライアル）なサブスクリプション契約を持つユーザーの一覧です。<br>（注意：現在のステータスはWebhook未実装のため、Stripe側と同期されていない可能性があります。）</p>
+            <p>サブスクリプション契約を持つユーザーの一覧です。（現在のステータスはWebhookで同期されます）</p>
 
-            <?php // ★ Display the list table
+            <?php // ★ Display the list table (Needs form for sorting/pagination links)
             ?>
             <form method="get">
-                <?php // Required hidden fields for list table pagination and sorting
+                <?php // Required hidden fields for list table
                 ?>
                 <input type="hidden" name="page" value="<?php echo esc_attr($_REQUEST['page']); ?>" />
-                <?php // Keep orderby and order if set
+                <?php // Keep orderby and order if set by user
                 if (isset($_REQUEST['orderby'])) {
                     echo '<input type="hidden" name="orderby" value="' . esc_attr($_REQUEST['orderby']) . '" />';
                 }
@@ -147,6 +147,237 @@ class EdelStripePaymentAdmin {
         </div>
     <?php
     }
+
+    public function ajax_refund_payment() {
+        // Nonce検証 (アクション名に PI ID を含める)
+        $pi_id = isset($_POST['pi_id']) ? sanitize_text_field($_POST['pi_id']) : '';
+        // 注意: Nonceアクション名がJS側と一致しているか確認してください
+        // (JSが data-nonce 属性の値を 'nonce' キーで送る想定)
+        check_ajax_referer(EDEL_STRIPE_PAYMENT_PREFIX . 'refund_payment_' . $pi_id, 'nonce');
+
+        // 権限チェック
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => '権限がありません。']);
+            return;
+        }
+
+        // 必須データチェック
+        if (empty($pi_id)) {
+            wp_send_json_error(['message' => 'Payment Intent IDが指定されていません。']);
+            return;
+        }
+
+        // Stripe Secret Key 取得
+        $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+        $is_live_mode = isset($options['mode']) && $options['mode'] === 'live';
+        $secret_key = $is_live_mode ? ($options['live_secret_key'] ?? '') : ($options['test_secret_key'] ?? '');
+        $error_log_prefix = '[Edel Stripe Admin Refund] ';
+
+        if (empty($secret_key)) {
+            error_log($error_log_prefix . 'Stripe Secret Key not configured.');
+            wp_send_json_error(['message' => 'Stripe APIキーが設定されていません。']);
+            return;
+        }
+
+        error_log($error_log_prefix . 'Refund requested for PI ID: ' . $pi_id);
+
+        try {
+            // --- StripeClient を使って返金処理 ---
+            $stripe = new \Stripe\StripeClient($secret_key);
+            \Stripe\Stripe::setApiVersion("2024-04-10"); // APIバージョン指定
+
+            // 返金を作成 (全額返金)
+            // 部分返金の場合は 'amount' => 金額(最小単位) を追加
+            $refund = $stripe->refunds->create([
+                'payment_intent' => $pi_id,
+                // 'amount' => 500, // 例: 500円(JPY) or 500セント($5.00 USD)の部分返金
+                'reason' => 'requested_by_customer', // 返金理由（任意）
+                'metadata' => [ // メタデータ（任意）
+                    'wp_user_id' => get_current_user_id(),
+                    'refunded_from' => 'WP Admin'
+                ]
+            ]);
+
+            // 返金オブジェクトのステータスを確認 (succeeded, pending, failed, requires_action)
+            error_log($error_log_prefix . 'Refund processed for PI: ' . $pi_id . '. Refund ID: ' . $refund->id . '. Status: ' . $refund->status);
+
+            if ($refund->status === 'succeeded' || $refund->status === 'pending') {
+                // 成功または処理中の場合（非同期で完了することがある）
+                wp_send_json_success([
+                    'message' => 'Stripeへの返金要求は成功しました。ステータスの最終的な更新はWebhook経由で行われます。Refund ID: ' . esc_html($refund->id),
+                    'refund_status' => $refund->status
+                ]);
+            } else {
+                // 返金自体が失敗した場合 (レアケース)
+                throw new Exception('返金処理が失敗しました。Stripeステータス: ' . $refund->status);
+            }
+        } catch (\Stripe\Exception\ApiErrorException $e) {
+            // Stripe APIエラー (例: 返金済み、PIが見つからないなど)
+            error_log($error_log_prefix . 'Stripe API Error processing refund for PI ' . $pi_id . ': ' . $e->getMessage());
+            wp_send_json_error(['message' => 'Stripe APIエラー: ' . esc_html($e->getMessage())]);
+        } catch (Exception $e) {
+            // その他のエラー
+            error_log($error_log_prefix . 'General Error processing refund for PI ' . $pi_id . ': ' . $e->getMessage());
+            wp_send_json_error(['message' => '返金処理中にエラーが発生しました: ' . esc_html($e->getMessage())]);
+        }
+        // finally ブロックは不要
+
+        // wp_send_json_* は wp_die() を呼ぶ
+    } // end ajax_refund_payment
+
+    public function ajax_cancel_subscription() {
+        // Nonce検証
+        $sub_id = isset($_POST['sub_id']) ? sanitize_text_field($_POST['sub_id']) : '';
+        check_ajax_referer(EDEL_STRIPE_PAYMENT_PREFIX . 'cancel_sub_' . $sub_id, 'nonce');
+
+        // 権限チェック
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => '権限がありません。']);
+            return;
+        }
+
+        // Stripeシークレットキー取得
+        $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+        $is_live_mode = isset($options['mode']) && $options['mode'] === 'live';
+        $secret_key = $is_live_mode ? ($options['live_secret_key'] ?? '') : ($options['test_secret_key'] ?? '');
+
+        if (empty($sub_id) || empty($secret_key)) {
+            wp_send_json_error(['message' => '必要な情報（サブスクリプションIDまたはAPIキー）が不足しています。']);
+            return;
+        }
+
+        $error_log_prefix = '[Edel Stripe Admin] ';
+
+        try {
+            // --- ★ StripeClient を使ってキャンセル ★ ---
+            // StripeClient を初期化
+            $stripe = new \Stripe\StripeClient($secret_key);
+            \Stripe\Stripe::setApiVersion("2024-04-10"); // APIバージョン指定は Client でも有効
+
+            error_log($error_log_prefix . 'Attempting immediate cancellation for SubID: ' . $sub_id . ' using StripeClient.');
+
+            // subscriptions->cancel を呼び出す
+            $subscription = $stripe->subscriptions->cancel($sub_id, []); // 第2引数はオプションパラメータ配列
+
+            error_log($error_log_prefix . 'Subscription cancellation processed via StripeClient for: ' . $sub_id . '. Result Status: ' . $subscription->status);
+
+            wp_send_json_success(['message' => 'Stripeサブスクリプションを即時キャンセルしました。ステータス変更はWebhook経由で反映されます。']);
+            // --- ★ StripeClient 利用ここまで ★ ---
+
+        } catch (\Stripe\Exception\ApiErrorException $e) {
+            error_log($error_log_prefix . 'Stripe API Error canceling subscription ' . $sub_id . ': ' . $e->getMessage());
+            if (strpos($e->getMessage(), 'No such subscription') !== false || strpos($e->getMessage(), 'subscription is already canceled') !== false) {
+                wp_send_json_success(['message' => 'サブスクリプションは既にキャンセルされているようです。']);
+            } else {
+                wp_send_json_error(['message' => 'Stripe APIエラー: ' . esc_html($e->getMessage())]);
+            }
+        } catch (Exception $e) {
+            error_log($error_log_prefix . 'General Error canceling subscription ' . $sub_id . ': ' . $e->getMessage());
+            wp_send_json_error(['message' => 'サブスクリプションのキャンセル中にエラーが発生しました。']);
+        }
+        // finally ブロックは不要
+
+        // wp_send_json_* は wp_die() を呼ぶので、ここで終了
+    } // end ajax_cancel_subscription
+
+
+    public function ajax_sync_subscription() {
+        // Check Nonce - Action name includes sub ID, nonce value sent in 'nonce' POST var
+        $sub_id = isset($_POST['sub_id']) ? sanitize_text_field($_POST['sub_id']) : '';
+        check_ajax_referer(EDEL_STRIPE_PAYMENT_PREFIX . 'sync_sub_' . $sub_id, 'nonce');
+
+        // Check capability
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => '権限がありません。']);
+            return;
+        }
+
+        // Get User ID passed from JS (linked to the subscription row)
+        $user_id = isset($_POST['user_id']) ? intval($_POST['user_id']) : 0;
+
+        // Check required data
+        if (empty($sub_id) || empty($user_id)) {
+            wp_send_json_error(['message' => '必要な情報（サブスクリプションIDまたはユーザーID）が不足しています。']);
+            return;
+        }
+
+        // Get Stripe Secret Key
+        $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+        $is_live_mode = isset($options['mode']) && $options['mode'] === 'live';
+        $secret_key = $is_live_mode ? ($options['live_secret_key'] ?? '') : ($options['test_secret_key'] ?? '');
+        $error_log_prefix = '[Edel Stripe Admin Sync] ';
+
+        if (empty($secret_key)) {
+            error_log($error_log_prefix . 'Stripe Secret Key not configured.');
+            wp_send_json_error(['message' => 'Stripe APIキーが設定されていません。']);
+            return;
+        }
+
+        error_log($error_log_prefix . 'Manual Sync requested for SubID: ' . $sub_id . ' for UserID: ' . $user_id);
+
+        try {
+            // Initialize Stripe Client
+            $stripe = new \Stripe\StripeClient($secret_key);
+            \Stripe\Stripe::setApiVersion("2024-04-10"); // Ensure consistent API version
+
+            // --- Retrieve Subscription from Stripe ---
+            $subscription = $stripe->subscriptions->retrieve($sub_id, []);
+            $new_status = $subscription->status; // Get current status from Stripe
+            error_log($error_log_prefix . 'Retrieved subscription ' . $sub_id . '. Current Stripe Status: ' . $new_status);
+
+            // --- Update WordPress Data ---
+            $user = get_userdata($user_id); // Get user data object
+            if (!$user) {
+                error_log($error_log_prefix . 'User not found for UserID: ' . $user_id);
+                throw new Exception('ユーザーが見つかりません (ID: ' . $user_id . ')');
+            }
+
+            // 1. Update User Meta Status
+            update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', $new_status);
+            error_log($error_log_prefix . "Updated user meta status to '{$new_status}' for UserID: {$user_id}");
+
+            // 2. Update User Role based on Status
+            $subscriber_role = $options['sub_subscriber_role'] ?? null;
+            if ($subscriber_role && get_role($subscriber_role)) {
+                $user_obj = new WP_User($user_id); // We already have $user, but let's use new for consistency
+                $active_statuses = ['active', 'trialing'];
+
+                if (in_array($new_status, $active_statuses)) {
+                    // Add/Set role if status is active
+                    if (!$user_obj->has_cap($subscriber_role)) {
+                        $user_obj->set_role($subscriber_role);
+                        error_log($error_log_prefix . "Assigned role '{$subscriber_role}' for UserID {$user_id} during sync (status: {$new_status})");
+                    } else {
+                        error_log($error_log_prefix . "User ID {$user_id} already has role '{$subscriber_role}'. No change needed.");
+                    }
+                } else {
+                    // Remove role if status is inactive
+                    if ($user_obj->has_cap($subscriber_role)) {
+                        $user_obj->remove_role($subscriber_role);
+                        error_log($error_log_prefix . "Removed role '{$subscriber_role}' for UserID {$user_id} during sync (status: {$new_status})");
+                    } else {
+                        error_log($error_log_prefix . "User ID {$user_id} does not have role '{$subscriber_role}'. No role removed.");
+                    }
+                }
+            } else if ($subscriber_role) {
+                error_log($error_log_prefix . "Configured subscriber role '{$subscriber_role}' does not exist.");
+            }
+
+            // --- Send Success Response ---
+            wp_send_json_success([
+                'message' => 'Stripeから最新情報を取得し、ステータスと権限を同期しました。',
+                'new_status' => $new_status // Return new status for potential JS update
+            ]);
+        } catch (\Stripe\Exception\ApiErrorException $e) {
+            error_log($error_log_prefix . 'Stripe API Error syncing subscription ' . $sub_id . ': ' . $e->getMessage());
+            wp_send_json_error(['message' => 'Stripe APIエラー: ' . esc_html($e->getMessage())]);
+        } catch (Exception $e) {
+            error_log($error_log_prefix . 'General Error syncing subscription ' . $sub_id . ': ' . $e->getMessage());
+            wp_send_json_error(['message' => '同期処理中にエラーが発生しました: ' . esc_html($e->getMessage())]);
+        } finally {
+            // Reset API key if needed (though StripeClient doesn't use global key)
+        }
+    } // end ajax_sync_subscription
 
     /**
      * Displays the settings page content with API key validation.
@@ -199,6 +430,22 @@ class EdelStripePaymentAdmin {
             $options['sub_admin_mail_body']     = isset($_POST['sub_admin_mail_body']) ? wp_kses_post($_POST['sub_admin_mail_body']) : '';
             $options['sub_customer_mail_subject'] = isset($_POST['sub_customer_mail_subject']) ? sanitize_text_field($_POST['sub_customer_mail_subject']) : '';
             $options['sub_customer_mail_body']  = isset($_POST['sub_customer_mail_body']) ? wp_kses_post($_POST['sub_customer_mail_body']) : '';
+
+            // 支払い失敗時メール設定の取得・サニタイズ
+            $options['sub_fail_send_admin'] = isset($_POST['sub_fail_send_admin']) ? '1' : '0';
+            $options['sub_fail_admin_subject'] = isset($_POST['sub_fail_admin_subject']) ? sanitize_text_field($_POST['sub_fail_admin_subject']) : '';
+            $options['sub_fail_admin_body'] = isset($_POST['sub_fail_admin_body']) ? wp_kses_post($_POST['sub_fail_admin_body']) : '';
+            $options['sub_fail_send_customer'] = isset($_POST['sub_fail_send_customer']) ? '1' : '0';
+            $options['sub_fail_customer_subject'] = isset($_POST['sub_fail_customer_subject']) ? sanitize_text_field($_POST['sub_fail_customer_subject']) : '';
+            $options['sub_fail_customer_body'] = isset($_POST['sub_fail_customer_body']) ? wp_kses_post($_POST['sub_fail_customer_body']) : '';
+            // キャンセル完了時メール設定の取得・サニタイズ
+            $options['sub_cancel_send_admin'] = isset($_POST['sub_cancel_send_admin']) ? '1' : '0';
+            $options['sub_cancel_admin_subject'] = isset($_POST['sub_cancel_admin_subject']) ? sanitize_text_field($_POST['sub_cancel_admin_subject']) : '';
+            $options['sub_cancel_admin_body'] = isset($_POST['sub_cancel_admin_body']) ? wp_kses_post($_POST['sub_cancel_admin_body']) : '';
+            $options['sub_cancel_send_customer'] = isset($_POST['sub_cancel_send_customer']) ? '1' : '0';
+            $options['sub_cancel_customer_subject'] = isset($_POST['sub_cancel_customer_subject']) ? sanitize_text_field($_POST['sub_cancel_customer_subject']) : '';
+            $options['sub_cancel_customer_body'] = isset($_POST['sub_cancel_customer_body']) ? wp_kses_post($_POST['sub_cancel_customer_body']) : '';
+
 
             // --- APIキー有効性チェック ---
             $test_key_valid = null;
@@ -265,17 +512,53 @@ class EdelStripePaymentAdmin {
         $default_ot_success_msg = "支払いが完了しました。ありがとうございます。\nメールをご確認ください。届いていない場合は、お問い合わせください。";
         $frontend_success_message = $options['frontend_success_message'] ?? $default_ot_success_msg;
         $ot_send_customer_email = $options['ot_send_customer_email'] ?? '0';
-        $ot_admin_mail_subject  = $options['ot_admin_mail_subject'] ?? '[{site_name}] 新しい決済がありました(買い切り)';
-        $ot_admin_mail_body     = $options['ot_admin_mail_body'] ?? "買い切り決済が完了しました。\n\n購入者Email: {customer_email}\n商品/内容: {item_name}\n金額: {amount}円\n決済日時: {transaction_date}\n\nPayment Intent ID: {payment_intent_id}\nCustomer ID: {customer_id}\nWordPress User ID: {user_id}";
-        $ot_customer_mail_subject = $options['ot_customer_mail_subject'] ?? '[{site_name}] ご購入ありがとうございます';
-        $ot_customer_mail_body  = $options['ot_customer_mail_body'] ?? "{user_name} 様\n\n「{item_name}」のご購入ありがとうございます。\n金額: {amount} 円\n日時: {transaction_date}\n\n--\n{site_name}\n{site_url}";
+
+        // ★★★ 買い切り用デフォルトテンプレート定義 ★★★
+        $default_ot_admin_subject = '[{site_name}] 新しい決済がありました(買い切り)';
+        $default_ot_admin_body = "買い切り決済が完了しました。\n\n購入者Email: {customer_email}\n商品/内容: {item_name}\n金額: {amount}\n決済日時: {transaction_date}\n\nPayment Intent ID: {payment_intent_id}\nCustomer ID: {customer_id}\nWordPress User ID: {user_id}";
+        $default_ot_customer_subject = '[{site_name}] ご購入ありがとうございます';
+        $default_ot_customer_body = "{user_name} 様\n\n「{item_name}」のご購入ありがとうございます。\n金額: {amount}\n日時: {transaction_date}\n\n--\n{site_name}\n{site_url}";
+        // ★★★ ここまで ★★★
+        $ot_admin_mail_subject  = $options['ot_admin_mail_subject'] ?? $default_ot_admin_subject; // ★ デフォルト値を使用
+        $ot_admin_mail_body     = $options['ot_admin_mail_body'] ?? $default_ot_admin_body; // ★ デフォルト値を使用
+        $ot_customer_mail_subject = $options['ot_customer_mail_subject'] ?? $default_ot_customer_subject; // ★ デフォルト値を使用
+        $ot_customer_mail_body  = $options['ot_customer_mail_body'] ?? $default_ot_customer_body; // ★ デフォルト値を使用
         // Subscription
         $sub_subscriber_role    = $options['sub_subscriber_role'] ?? '';
         $sub_send_customer_email = $options['sub_send_customer_email'] ?? '0';
-        $sub_admin_mail_subject = $options['sub_admin_mail_subject'] ?? '[{site_name}] 新しいサブスクリプション申込がありました';
-        $sub_admin_mail_body    = $options['sub_admin_mail_body'] ?? "サブスクリプション申込がありました。\n\n購入者Email: {customer_email}\nプラン: {item_name} ({plan_id})\n顧客ID: {customer_id}\nサブスクID: {subscription_id}\nUser ID: {user_id}";
-        $sub_customer_mail_subject = $options['sub_customer_mail_subject'] ?? '[{site_name}] サブスクリプションへようこそ';
-        $sub_customer_mail_body = $options['sub_customer_mail_body'] ?? "{user_name} 様\n\nサブスクリプション「{item_name}」へのお申し込みありがとうございます。\n\nマイアカウントページから契約状況をご確認いただけます。\n\n--\n{site_name}\n{site_url}";
+        // ★ サブスク用デフォルトテンプレート定義 ★
+        $default_sub_admin_subject = '[{site_name}] 新しいサブスクリプション申込がありました';
+        $default_sub_admin_body = "サブスクリプション申込がありました。\n\n購入者Email: {customer_email}\nプラン: {item_name} ({plan_id})\n顧客ID: {customer_id}\nサブスクID: {subscription_id}\nUser ID: {user_id}";
+        $default_sub_customer_subject = '[{site_name}] サブスクリプションへようこそ';
+        $default_sub_customer_body = "{user_name} 様\n\nサブスクリプション「{item_name}」へのお申し込みありがとうございます。\n\nマイアカウントページから契約状況をご確認いただけます。\n\n--\n{site_name}\n{site_url}";
+        // ★支払い失敗時デフォルト★
+        $default_sub_fail_admin_subject = '[{site_name}] サブスク支払い失敗通知(Admin)';
+        $default_sub_fail_admin_body = "支払い失敗。\nEmail:{customer_email}\nSubID:{subscription_id}\nPlan:{item_name}({plan_id})";
+        $default_sub_fail_customer_subject = '[{site_name}] お支払い情報確認依頼';
+        $default_sub_fail_customer_body = "{user_name} 様\nサブスク「{item_name}」の支払失敗。カード情報更新を。";
+        // ★キャンセル時デフォルト★
+        $default_sub_cancel_admin_subject = '[{site_name}] サブスクキャンセル通知(Admin)';
+        $default_sub_cancel_admin_body = "キャンセル。\nEmail:{customer_email}\nSubID:{subscription_id}\nPlan:{item_name}({plan_id})";
+        $default_sub_cancel_customer_subject = '[{site_name}] サブスク解約のお知らせ';
+        $default_sub_cancel_customer_body = "{user_name} 様\n「{item_name}」の解約完了。";
+        // ★ここまでデフォルト定義★
+        $sub_admin_mail_subject = $options['sub_admin_mail_subject'] ?? $default_sub_admin_subject;
+        $sub_admin_mail_body    = $options['sub_admin_mail_body'] ?? $default_sub_admin_body;
+        $sub_customer_mail_subject = $options['sub_customer_mail_subject'] ?? $default_sub_customer_subject;
+        $sub_customer_mail_body = $options['sub_customer_mail_body'] ?? $default_sub_customer_body;
+        $sub_fail_send_admin = $options['sub_fail_send_admin'] ?? '1';
+        $sub_fail_admin_subject = $options['sub_fail_admin_subject'] ?? $default_sub_fail_admin_subject;
+        $sub_fail_admin_body = $options['sub_fail_admin_body'] ?? $default_sub_fail_admin_body;
+        $sub_fail_send_customer = $options['sub_fail_send_customer'] ?? '1';
+        $sub_fail_customer_subject = $options['sub_fail_customer_subject'] ?? $default_sub_fail_customer_subject;
+        $sub_fail_customer_body = $options['sub_fail_customer_body'] ?? $default_sub_fail_customer_body;
+        $sub_cancel_send_admin = $options['sub_cancel_send_admin'] ?? '1';
+        $sub_cancel_admin_subject = $options['sub_cancel_admin_subject'] ?? $default_sub_cancel_admin_subject;
+        $sub_cancel_admin_body = $options['sub_cancel_admin_body'] ?? $default_sub_cancel_admin_body;
+        $sub_cancel_send_customer = $options['sub_cancel_send_customer'] ?? '1';
+        $sub_cancel_customer_subject = $options['sub_cancel_customer_subject'] ?? $default_sub_cancel_customer_subject;
+        $sub_cancel_customer_body = $options['sub_cancel_customer_body'] ?? $default_sub_cancel_customer_body;
+
 
         // Placeholders list
         $placeholders = '<code>{item_name}</code>, <code>{amount}</code>, <code>{customer_email}</code>, <code>{payment_intent_id}</code>(買い切り), <code>{customer_id}</code>, <code>{transaction_date}</code>, <code>{user_name}</code>, <code>{user_id}</code>, <code>{site_name}</code>, <code>{site_url}</code>, <code>{subscription_id}</code>(サブスク), <code>{plan_id}</code>(サブスク)';
@@ -562,15 +845,16 @@ class EdelStripePaymentAdmin {
                     </table>
                     <hr>
                     <h2>メール通知設定（サブスクリプション）</h2>
+                    <p>サブスクリプションに関連するイベント発生時に送信されるメールです。</p>
                     <table class="form-table">
                         <tr>
                             <th colspan="2">
-                                <h3>管理者向け通知メール (申込時)</h3>
+                                <h3>管理者向け通知メール (申込成功時)</h3>
                             </th>
                         </tr>
                         <tr>
                             <th><label for="sub_admin_mail_subject">件名</label></th>
-                            <td><input type="text" id="sub_admin_mail_subject" name="sub_admin_mail_subject" value="<?php echo esc_attr($sub_admin_mail_subject); ?>" class="large-text" placeholder="<?php echo esc_attr($default_admin_subject); ?>"></td>
+                            <td><input type="text" id="sub_admin_mail_subject" name="sub_admin_mail_subject" value="<?php echo esc_attr($sub_admin_mail_subject); ?>" class="large-text"></td>
                         </tr>
                         <tr>
                             <th><label for="sub_admin_mail_body">本文</label></th>
@@ -578,20 +862,19 @@ class EdelStripePaymentAdmin {
                                 <p class="description">利用可能なプレースホルダー: <?php echo $placeholders; ?></p>
                             </td>
                         </tr>
+
                         <tr>
                             <th colspan="2">
-                                <h3>購入者向け通知メール (申込時)</h3>
+                                <h3>購入者向け通知メール (申込成功時)</h3>
                             </th>
                         </tr>
                         <tr>
                             <th><label for="sub_send_customer_email">送信設定</label></th>
-                            <td><label><input type="checkbox" id="sub_send_customer_email" name="sub_send_customer_email" value="1" <?php checked($sub_send_customer_email, '1'); ?>> 申込完了時に購入者へメールを送信する</label>
-                                <p class="description">Stripe側メールと重複注意。</p>
-                            </td>
+                            <td><label><input type="checkbox" id="sub_send_customer_email" name="sub_send_customer_email" value="1" <?php checked($sub_send_customer_email, '1'); ?>> 申込完了時に購入者へメールを送信する</label></td>
                         </tr>
                         <tr>
                             <th><label for="sub_customer_mail_subject">件名</label></th>
-                            <td><input type="text" id="sub_customer_mail_subject" name="sub_customer_mail_subject" value="<?php echo esc_attr($sub_customer_mail_subject); ?>" class="large-text" placeholder="<?php echo esc_attr($default_customer_subject); ?>"></td>
+                            <td><input type="text" id="sub_customer_mail_subject" name="sub_customer_mail_subject" value="<?php echo esc_attr($sub_customer_mail_subject); ?>" class="large-text"></td>
                         </tr>
                         <tr>
                             <th><label for="sub_customer_mail_body">本文</label></th>
@@ -599,8 +882,101 @@ class EdelStripePaymentAdmin {
                                 <p class="description">利用可能なプレースホルダー: <?php echo $placeholders; ?></p>
                             </td>
                         </tr>
-                        <?php // TODO: Add settings for other subscription emails (failed payment, cancellation etc.)
-                        ?>
+
+                        <tr>
+                            <td colspan="2">
+                                <hr>
+                            </td>
+                        </tr> <?php // Separator
+                                ?>
+
+                        <tr>
+                            <th colspan="2">
+                                <h3>管理者向け通知メール (支払い失敗時)</h3>
+                            </th>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_fail_send_admin">送信設定</label></th>
+                            <td><label><input type="checkbox" id="sub_fail_send_admin" name="sub_fail_send_admin" value="1" <?php checked($sub_fail_send_admin, '1'); ?>> 支払い失敗時に管理者へメールを送信する</label></td>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_fail_admin_subject">件名</label></th>
+                            <td><input type="text" id="sub_fail_admin_subject" name="sub_fail_admin_subject" value="<?php echo esc_attr($sub_fail_admin_subject); ?>" class="large-text"></td>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_fail_admin_body">本文</label></th>
+                            <td><textarea id="sub_fail_admin_body" name="sub_fail_admin_body" rows="6" class="large-text"><?php echo esc_textarea($sub_fail_admin_body); ?></textarea>
+                                <p class="description">利用可能なプレースホルダー: <?php echo $placeholders; ?></p>
+                            </td>
+                        </tr>
+
+                        <tr>
+                            <th colspan="2">
+                                <h3>購入者向け通知メール (支払い失敗時)</h3>
+                            </th>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_fail_send_customer">送信設定</label></th>
+                            <td><label><input type="checkbox" id="sub_fail_send_customer" name="sub_fail_send_customer" value="1" <?php checked($sub_fail_send_customer, '1'); ?>> 支払い失敗時に購入者へメールを送信する</label></td>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_fail_customer_subject">件名</label></th>
+                            <td><input type="text" id="sub_fail_customer_subject" name="sub_fail_customer_subject" value="<?php echo esc_attr($sub_fail_customer_subject); ?>" class="large-text"></td>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_fail_customer_body">本文</label></th>
+                            <td><textarea id="sub_fail_customer_body" name="sub_fail_customer_body" rows="6" class="large-text"><?php echo esc_textarea($sub_fail_customer_body); ?></textarea>
+                                <p class="description">利用可能なプレースホルダー: <?php echo $placeholders; ?></p>
+                            </td>
+                        </tr>
+
+                        <tr>
+                            <td colspan="2">
+                                <hr>
+                            </td>
+                        </tr> <?php // Separator
+                                ?>
+
+                        <tr>
+                            <th colspan="2">
+                                <h3>管理者向け通知メール (キャンセル完了時)</h3>
+                            </th>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_cancel_send_admin">送信設定</label></th>
+                            <td><label><input type="checkbox" id="sub_cancel_send_admin" name="sub_cancel_send_admin" value="1" <?php checked($sub_cancel_send_admin, '1'); ?>> キャンセル時に管理者へメールを送信する</label></td>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_cancel_admin_subject">件名</label></th>
+                            <td><input type="text" id="sub_cancel_admin_subject" name="sub_cancel_admin_subject" value="<?php echo esc_attr($sub_cancel_admin_subject); ?>" class="large-text"></td>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_cancel_admin_body">本文</label></th>
+                            <td><textarea id="sub_cancel_admin_body" name="sub_cancel_admin_body" rows="6" class="large-text"><?php echo esc_textarea($sub_cancel_admin_body); ?></textarea>
+                                <p class="description">利用可能なプレースホルダー: <?php echo $placeholders; ?></p>
+                            </td>
+                        </tr>
+
+                        <tr>
+                            <th colspan="2">
+                                <h3>購入者向け通知メール (キャンセル完了時)</h3>
+                            </th>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_cancel_send_customer">送信設定</label></th>
+                            <td><label><input type="checkbox" id="sub_cancel_send_customer" name="sub_cancel_send_customer" value="1" <?php checked($sub_cancel_send_customer, '1'); ?>> キャンセル時に購入者へメールを送信する</label></td>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_cancel_customer_subject">件名</label></th>
+                            <td><input type="text" id="sub_cancel_customer_subject" name="sub_cancel_customer_subject" value="<?php echo esc_attr($sub_cancel_customer_subject); ?>" class="large-text"></td>
+                        </tr>
+                        <tr>
+                            <th><label for="sub_cancel_customer_body">本文</label></th>
+                            <td><textarea id="sub_cancel_customer_body" name="sub_cancel_customer_body" rows="6" class="large-text"><?php echo esc_textarea($sub_cancel_customer_body); ?></textarea>
+                                <p class="description">利用可能なプレースホルダー: <?php echo $placeholders; ?></p>
+                            </td>
+                        </tr>
+
                     </table>
                 </div>
                 <p class="submit">

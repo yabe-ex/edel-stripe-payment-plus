@@ -17,7 +17,9 @@ class EdelStripePaymentFront {
      * Registers the REST API endpoint for Stripe Webhooks.
      */
     public function register_webhook_endpoint() {
-        register_rest_route(
+        error_log('[Edel Stripe REST] Attempting to register webhook endpoint /edel-stripe/v1/webhook...'); // ★ Log Start
+
+        $registered = register_rest_route(
             'edel-stripe/v1', // Namespace
             '/webhook',       // Route
             array(
@@ -26,313 +28,1046 @@ class EdelStripePaymentFront {
                 'permission_callback' => '__return_true', // Allow public access (Stripe needs to reach it) - Security is handled by signature verification
             )
         );
-        error_log('Edel Stripe: Webhook REST route registered.'); // Log registration
+        if ($registered) {
+            error_log('[Edel Stripe REST] Webhook endpoint registered successfully.');
+        } else {
+            error_log('[Edel Stripe REST] FAILED to register webhook endpoint!');
+        }
     }
 
     /**
-     * ★新規追加: Handles incoming Stripe Webhook events.
-     * Verifies the signature and processes the event.
+     * ★新規追加: Renders the [edel_stripe_my_account] shortcode content.
+     * Displays subscription status and payment history for logged-in users.
      *
-     * @param WP_REST_Request $request The request object.
-     * @return WP_REST_Response Response object.
+     * @param array $atts Shortcode attributes (currently unused).
+     * @return string HTML output for the my account page.
      */
-    public function handle_webhook(WP_REST_Request $request) {
-        $payload = $request->get_body();
-        $sig_header = $request->get_header('stripe_signature');
-        $event = null;
-        $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
-        $endpoint_secret_test = $options['test_webhook_secret'] ?? '';
-        $endpoint_secret_live = $options['live_webhook_secret'] ?? '';
-        $error_log_prefix = '[Edel Stripe Webhook] ';
-
-        error_log($error_log_prefix . 'Received webhook request.');
-
-        if (empty($sig_header)) {
-            error_log($error_log_prefix . 'Missing signature.');
-            return new WP_REST_Response(['error' => 'Missing signature'], 400);
-        }
-        if (empty($endpoint_secret_test) && empty($endpoint_secret_live)) {
-            error_log($error_log_prefix . 'Secret not configured.');
-            return new WP_REST_Response(['error' => 'Webhook secret not configured'], 500);
+    public function render_my_account_page($atts) {
+        // Check if user is logged in
+        if (!is_user_logged_in()) {
+            return '<p>このコンテンツを表示するには<a href="' . esc_url(wp_login_url(get_permalink())) . '">ログイン</a>してください。</p>';
         }
 
-        // Determine which secret to use based on preliminary parsing (or try test first)
-        // A more robust way might check the event->livemode AFTER constructing with one secret,
-        // but requires at least one secret to be potentially valid.
-        // Let's try test first, then potentially live if needed and possible.
-        // Or better: check livemode after constructing with test, then re-construct if needed.
-        $endpoint_secret = $endpoint_secret_test; // Assume test first for construction attempt
-        if (empty($endpoint_secret)) $endpoint_secret = $endpoint_secret_live; // Fallback to live if test is empty
-        if (empty($endpoint_secret)) { // If both are empty after all
-            error_log($error_log_prefix . 'Both webhook secrets are empty in settings.');
-            return new WP_REST_Response(['error' => 'Webhook secret not configured'], 500);
+        // Get current user data
+        $user_id = get_current_user_id();
+        $user = get_userdata($user_id);
+        if (!$user) {
+            return '<p>ユーザー情報の取得に失敗しました。</p>';
         }
 
+        // Get saved data from user meta
+        $subscription_id = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_id', true);
+        $customer_id = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'customer_id', true);
+        // Get status from meta as a fallback or initial value
+        $subscription_status_meta = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', true);
 
-        try {
-            // Construct the event object, this verifies the signature
-            $event = \Stripe\Webhook::constructEvent(
-                $payload,
-                $sig_header,
-                $endpoint_secret
-            );
+        // Variables to store fetched Stripe data
+        $stripe_subscription = null;
+        $stripe_error_message = '';
+        $plan_details_str = 'プラン情報取得中...'; // Default text
+        $next_billing_str = '取得中...';
+        $cancel_at_str = '';
+        $current_status_from_stripe = $subscription_status_meta ?: '不明'; // Use meta as fallback
 
-            // Double check if the correct secret was used based on livemode
-            $correct_secret = $event->livemode ? $endpoint_secret_live : $endpoint_secret_test;
-            if (empty($correct_secret)) {
-                throw new \Stripe\Exception\SignatureVerificationException('Appropriate webhook secret not configured for event mode.', $sig_header, $payload);
-            }
-            // If the secret used didn't match the event mode, reconstruct with the correct one
-            if ($correct_secret !== $endpoint_secret) {
-                $event = \Stripe\Webhook::constructEvent($payload, $sig_header, $correct_secret);
-            }
-            $mode_used = $event->livemode ? 'Live' : 'Test';
-            error_log($error_log_prefix . 'Signature verified (' . $mode_used . '). Event ID: ' . $event->id . ' Type: ' . $event->type);
-        } catch (\UnexpectedValueException $e) { /* Invalid payload */
-            error_log($error_log_prefix . 'Webhook Error (Invalid Payload): ' . $e->getMessage());
-            return new WP_REST_Response(['error' => 'Invalid payload'], 400);
-        } catch (\Stripe\Exception\SignatureVerificationException $e) { /* Invalid signature */
-            error_log($error_log_prefix . 'Webhook Error (Invalid Signature): ' . $e->getMessage());
-            return new WP_REST_Response(['error' => 'Invalid signature'], 400);
-        } catch (Exception $e) { /* Other construction errors */
-            error_log($error_log_prefix . 'Webhook Error (Construction): ' . $e->getMessage());
-            return new WP_REST_Response(['error' => 'Webhook processing error'], 500);
-        }
+        // --- Fetch current subscription details from Stripe API if ID exists ---
+        if ($subscription_id) {
+            $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+            $is_live_mode = isset($options['mode']) && $options['mode'] === 'live';
+            $secret_key = $is_live_mode ? ($options['live_secret_key'] ?? '') : ($options['test_secret_key'] ?? '');
 
-        // --- Handle the event based on its type ---
-        global $wpdb;
-        $table_name = $wpdb->prefix . EDEL_STRIPE_PAYMENT_PREFIX . 'main';
+            if (!empty($secret_key)) {
+                try {
+                    $stripe = new \Stripe\StripeClient($secret_key);
+                    \Stripe\Stripe::setApiVersion("2024-04-10");
 
-        try {
-            switch ($event->type) {
-                case 'invoice.payment_succeeded':
-                    $invoice = $event->data->object;
-                    // Check if it's for a subscription payment
-                    if (isset($invoice->subscription) && !empty($invoice->subscription) && $invoice->billing_reason === 'subscription_cycle') {
-                        error_log($error_log_prefix . 'Processing recurring payment success for SubID: ' . $invoice->subscription . ' InvoiceID: ' . $invoice->id);
-                        $customer_id = $invoice->customer;
-                        $subscription_id = $invoice->subscription;
-                        $payment_intent_id = $invoice->payment_intent; // Might be null if paid out of band
-                        $amount_paid = $invoice->amount_paid; // Amount in smallest unit
-                        $currency = $invoice->currency;
-                        $plan_id = null;
-                        if (isset($invoice->lines->data[0]->price->id)) {
-                            $plan_id = $invoice->lines->data[0]->price->id; // Price ID (plan)
-                        }
-                        $item_name = 'Subscription Recurring Payment (' . ($plan_id ?: $subscription_id) . ')'; // Item name
+                    // Retrieve subscription and expand plan and product info
+                    $stripe_subscription = $stripe->subscriptions->retrieve($subscription_id, ['expand' => ['plan.product']]);
 
-                        // Find WordPress user by Stripe Customer ID
-                        $user = $this->get_user_by_stripe_customer_id($customer_id);
-                        if ($user) {
-                            $user_id = $user->ID;
-                            // Record this payment in the custom table
-                            $data_to_insert = [ /* ... Prepare data array ... */
-                                'user_id' => $user_id,
-                                'payment_intent_id' => $payment_intent_id ?? ('invoice_' . $invoice->id),
-                                'customer_id' => $customer_id,
-                                'subscription_id' => $subscription_id,
-                                'status' => 'succeeded',
-                                'amount' => $amount_paid,
-                                'currency' => $currency,
-                                'item_name' => $item_name,
-                                'created_at_gmt' => gmdate('Y-m-d H:i:s', $invoice->created), // Use invoice creation time
-                                'updated_at_gmt' => gmdate('Y-m-d H:i:s', time()),
-                                'metadata' => maybe_serialize(['plan_id' => $plan_id, 'invoice_id' => $invoice->id])
-                            ];
-                            $data_formats = ['%d', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s'];
-                            $inserted = $wpdb->insert($table_name, $data_to_insert, $data_formats);
-                            if ($inserted === false) {
-                                error_log($error_log_prefix . "Failed to insert recurring payment record. DB Error: " . $wpdb->last_error);
-                            }
+                    if ($stripe_subscription) {
+                        $current_status_from_stripe = $stripe_subscription->status; // Get the most current status
 
-                            // Update user meta status and role (ensure active)
-                            update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', 'active');
-                            $subscriber_role = $options['sub_subscriber_role'] ?? null;
-                            if ($subscriber_role && get_role($subscriber_role)) {
-                                $user_obj = new WP_User($user_id);
-                                if (!$user_obj->has_cap($subscriber_role)) { // Add role if they don't have it
-                                    $user_obj->add_role($subscriber_role);
-                                    error_log($error_log_prefix . "Re-assigned role '{$subscriber_role}' on recurring payment success for user ID {$user_id}");
-                                }
-                            }
-                            // Optionally send recurring payment success email? (Probably not needed if Stripe sends receipt)
-                        } else {
-                            error_log($error_log_prefix . "User not found for Customer ID: " . $customer_id . " in event invoice.payment_succeeded");
-                        }
-                    }
-                    break;
+                        // Format plan details for display
+                        $plan = $stripe_subscription->plan;
+                        if ($plan) {
+                            $plan_amount = $plan->amount ?? 0;
+                            $plan_currency = $plan->currency ?? 'jpy';
+                            $plan_interval = $plan->interval ?? '?';
+                            $plan_interval_count = $plan->interval_count ?? 1;
+                            $product_name = ($plan->product && is_string($plan->product->name)) ? $plan->product->name : '不明な商品';
 
-                case 'invoice.payment_failed':
-                    $invoice = $event->data->object;
-                    // Check if it's related to a subscription
-                    if (isset($invoice->subscription) && !empty($invoice->subscription)) {
-                        error_log($error_log_prefix . 'Processing payment failure for SubID: ' . $invoice->subscription . ' InvoiceID: ' . $invoice->id);
-                        $customer_id = $invoice->customer;
-                        $subscription_id = $invoice->subscription;
-                        // Find WordPress user
-                        $user = $this->get_user_by_stripe_customer_id($customer_id);
-                        if ($user) {
-                            $user_id = $user->ID;
-                            // Update user meta status (e.g., 'past_due', 'payment_failed')
-                            // Stripe subscription status might update via customer.subscription.updated later
-                            update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', 'payment_failed');
-                            error_log($error_log_prefix . "Set user meta status to 'payment_failed' for user ID {$user_id}");
-                            // TODO: Send payment failed notification email (using new templates?)
-                            // TODO: Consider role removal based on retry logic/grace period (handle in customer.subscription.updated?)
-                        } else {
-                            error_log($error_log_prefix . "User not found for Customer ID: " . $customer_id . " in event invoice.payment_failed");
-                        }
-                    }
-                    break;
-
-                case 'customer.subscription.deleted':
-                    $subscription = $event->data->object;
-                    error_log($error_log_prefix . 'Processing subscription cancellation for SubID: ' . $subscription->id);
-                    $customer_id = $subscription->customer;
-                    // Find WordPress user
-                    $user = $this->get_user_by_stripe_customer_id($customer_id);
-                    if ($user) {
-                        $user_id = $user->ID;
-                        // Update user meta status
-                        update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', 'canceled');
-                        // Remove subscriber role
-                        $subscriber_role = $options['sub_subscriber_role'] ?? null;
-                        if ($subscriber_role) {
-                            $user_obj = new WP_User($user_id);
-                            if ($user_obj->has_cap($subscriber_role)) {
-                                $user_obj->remove_role($subscriber_role);
-                                error_log($error_log_prefix . "Removed role '{$subscriber_role}' for user ID {$user_id} due to subscription cancellation.");
-                            }
-                        }
-                        // TODO: Send cancellation notification email?
-                    } else {
-                        error_log($error_log_prefix . "User not found for Customer ID: " . $customer_id . " in event customer.subscription.deleted");
-                    }
-                    break;
-
-                case 'customer.subscription.updated':
-                    $subscription = $event->data->object;
-                    error_log($error_log_prefix . 'Processing subscription update for SubID: ' . $subscription->id . ' New Status: ' . $subscription->status);
-                    $customer_id = $subscription->customer;
-                    // Find WordPress user
-                    $user = $this->get_user_by_stripe_customer_id($customer_id);
-                    if ($user) {
-                        $user_id = $user->ID;
-                        $new_status = $subscription->status; // e.g., active, past_due, unpaid, canceled, trialing
-                        // Update user meta status
-                        update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', $new_status);
-                        error_log($error_log_prefix . "Updated user meta status to '{$new_status}' for user ID {$user_id}");
-
-                        // Update user role based on new status
-                        $subscriber_role = $options['sub_subscriber_role'] ?? null;
-                        if ($subscriber_role) {
-                            $user_obj = new WP_User($user_id);
-                            if (in_array($new_status, ['active', 'trialing'])) {
-                                // Ensure user has the role
-                                if (!$user_obj->has_cap($subscriber_role)) {
-                                    $user_obj->add_role($subscriber_role); // Use add_role to avoid removing other roles maybe? Or stick to set_role? Let's use set_role for simplicity.
-                                    $user_obj->set_role($subscriber_role);
-                                    error_log($error_log_prefix . "Assigned role '{$subscriber_role}' on subscription update for user ID {$user_id}");
-                                }
+                            $amount_str = '';
+                            if ($plan_currency === 'jpy') {
+                                $amount_str = number_format($plan_amount) . '円';
+                            } elseif ($plan_currency === 'usd') {
+                                $amount_str = '$' . number_format($plan_amount / 100, 2);
                             } else {
-                                // If status is not active/trialing, remove the role
-                                if ($user_obj->has_cap($subscriber_role)) {
-                                    $user_obj->remove_role($subscriber_role);
-                                    error_log($error_log_prefix . "Removed role '{$subscriber_role}' on subscription update (status: {$new_status}) for user ID {$user_id}");
-                                }
+                                $amount_str = number_format($plan_amount) . ' ' . strtoupper($plan_currency);
                             }
+
+                            $interval_str = '';
+                            if ($plan_interval_count == 1) {
+                                if ($interval == 'month') $interval_str = '月';
+                                elseif ($interval == 'year') $interval_str = '年';
+                                elseif ($interval == 'week') $interval_str = '週';
+                                elseif ($interval == 'day') $interval_str = '日';
+                                else $interval_str = $interval;
+                            } else {
+                                $interval_str = $plan_interval_count . ' ';
+                                if ($interval == 'month') $interval_str .= 'ヶ月';
+                                elseif ($interval == 'year') $interval_str .= '年';
+                                else $interval_str .= $interval;
+                            }
+
+                            $plan_details_str = esc_html($product_name) . ' (' . $amount_str . ' / ' . esc_html($interval_str) . ')';
+                        } else {
+                            $plan_details_str = 'プラン情報取得失敗';
                         }
-                        // TODO: Update next billing date from $subscription->current_period_end ? Store in user meta?
-                        // update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_next_bill', gmdate('Y-m-d H:i:s', $subscription->current_period_end));
-                    } else {
-                        error_log($error_log_prefix . "User not found for Customer ID: " . $customer_id . " in event customer.subscription.updated");
-                    }
-                    break;
 
-                // Add other event handlers here if needed
+                        // Format next billing date
+                        if ($stripe_subscription->current_period_end) {
+                            if ($stripe_subscription->status === 'active' || $stripe_subscription->status === 'trialing') {
+                                $next_billing_str = wp_date(get_option('date_format'), $stripe_subscription->current_period_end);
+                            } else {
+                                $next_billing_str = '---'; // No next billing if inactive
+                            }
+                        } else {
+                            $next_billing_str = '---';
+                        }
 
-                default:
-                    error_log('[Edel Stripe Webhook] Received unhandled event type: ' . $event->type);
-            }
-        } catch (Exception $e) {
-            // Catch errors during event processing
-            error_log('[Edel Stripe Webhook] Error processing event (' . $event->id . ' Type: ' . $event->type . '): ' . $e->getMessage());
-            // Return 500 so Stripe might retry? Or return 200 to prevent retries if error is permanent?
-            // Let's return 500 for now to indicate processing failure.
-            return new WP_REST_Response(['error' => 'Webhook event processing error'], 500);
-        }
+                        // Check if cancellation is scheduled
+                        if ($stripe_subscription->cancel_at_period_end) {
+                            $cancel_at_str = ' (期間終了時 ' . wp_date(get_option('date_format'), $stripe_subscription->current_period_end) . ' にキャンセル予定)';
+                        }
 
-
-        // Return a 200 OK response to Stripe
-        return new WP_REST_Response(['received' => true], 200);
-    } // end handle_webhook
-
-    /**
-     * Enqueues frontend scripts and styles.
-     */
-    public function front_enqueue() {
-        // Load always for now
-        wp_enqueue_script('stripe-js', 'https://js.stripe.com/v3/', array(), null, true);
-
-        $version  = (defined('EDEL_STRIPE_PAYMENT_DEVELOP') && true === EDEL_STRIPE_PAYMENT_DEVELOP) ? time() : EDEL_STRIPE_PAYMENT_VERSION;
-        $strategy = array('in_footer' => true, 'strategy'  => 'defer');
-
-        wp_enqueue_style(EDEL_STRIPE_PAYMENT_SLUG . '-front', EDEL_STRIPE_PAYMENT_URL . '/css/front.css', array(), $version);
-        wp_enqueue_script(EDEL_STRIPE_PAYMENT_SLUG . '-front', EDEL_STRIPE_PAYMENT_URL . '/js/front.js', array('jquery', 'stripe-js'), $version, $strategy);
-
-        // Localize script - Pass data from PHP to JavaScript
-        $stripe_options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
-        $is_live_mode = isset($stripe_options['mode']) && $stripe_options['mode'] === 'live';
-        $publishable_key = $is_live_mode ? ($stripe_options['live_publishable_key'] ?? '') : ($stripe_options['test_publishable_key'] ?? '');
-
-        // ★追加：フロント成功メッセージを取得（デフォルト値も考慮）
-        $default_success_message = "支払いが完了しました。ありがとうございます。\nメールをご確認ください。届いていない場合は、お問い合わせください。";
-        $frontend_success_message = $stripe_options['frontend_success_message'] ?? $default_success_message;
-
-        $params = array(
-            'ajax_url' => admin_url('admin-ajax.php'),
-            'publishable_key' => $publishable_key,
-            'record_nonce' => wp_create_nonce(EDEL_STRIPE_PAYMENT_PREFIX . 'record_payment_nonce'),
-            // ↓↓↓ フロント成功メッセージを追加 ↓↓↓
-            'success_message' => $frontend_success_message,
-            // ↑↑↑ フロント成功メッセージを追加 ↑↑↑
-        );
-        wp_localize_script(EDEL_STRIPE_PAYMENT_SLUG . '-front', 'edelStripeParams', $params);
-    }
-
-    public function render_subscription_shortcode($atts) {
-        // --- Step 1: Process Shortcode Attributes ---
-        $attributes = shortcode_atts(array(
-            'plan_id'     => '', // Stripe Price ID (必須)
-            'button_text' => '申し込む', // Default button text
-        ), $atts);
-
-        $plan_id = sanitize_text_field($attributes['plan_id']);
-        $button_text = sanitize_text_field($attributes['button_text']);
-
-        if (empty($plan_id) || strpos($plan_id, 'price_') !== 0) {
-            if (current_user_can('manage_options')) {
-                return '<p><span class="orange b">Edel Stripe Payment エラー: ショートコードに有効なプランID (plan_id="price_...") が指定されていません。</span></p>';
+                        // Update user meta status if different from Stripe (optional sync here)
+                        if ($current_status_from_stripe !== $subscription_status_meta) {
+                            update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', $current_status_from_stripe);
+                            error_log("[Edel Stripe MyAccount] Synced status for User ID {$user_id} to '{$current_status_from_stripe}'");
+                            // Optionally update role here too, mirroring webhook logic
+                        }
+                    } // end if $stripe_subscription
+                } catch (\Stripe\Exception\ApiErrorException $e) {
+                    $stripe_error_message = 'Stripe APIエラー: ' . $e->getMessage();
+                    error_log(EDEL_STRIPE_PAYMENT_PREFIX . $stripe_error_message);
+                    $plan_details_str = '取得エラー';
+                    $next_billing_str = '取得エラー';
+                } catch (Exception $e) {
+                    $stripe_error_message = 'サブスクリプション情報の取得中にエラーが発生しました。';
+                    error_log(EDEL_STRIPE_PAYMENT_PREFIX . $stripe_error_message . $e->getMessage());
+                    $plan_details_str = '取得エラー';
+                    $next_billing_str = '取得エラー';
+                } finally {
+                    \Stripe\Stripe::setApiKey(null);
+                }
             } else {
-                return '';
+                $stripe_error_message = 'Stripe APIキーが設定されていません。';
+                $plan_details_str = '取得不可';
+                $next_billing_str = '取得不可';
             }
-        }
+        } // end if $subscription_id
 
-        // --- Step 2: Get Plugin Settings ---
-        $stripe_options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
-        $require_consent = $stripe_options['require_consent'] ?? '1'; // Consent setting
-        // ★ 同意文言生成に必要な設定値を取得
-        $privacy_page_id = $stripe_options['privacy_page_id'] ?? 0;
-        $terms_page_id   = $stripe_options['terms_page_id'] ?? 0;
-        $consent_text_custom = $stripe_options['consent_text'] ?? '';
-        // Publishable key needed by JS (enqueued separately)
+        // --- Fetch Payment History ---
+        global $wpdb;
+        $payment_table = $wpdb->prefix . EDEL_STRIPE_PAYMENT_PREFIX . 'main';
+        $payments = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM {$payment_table} WHERE user_id = %d ORDER BY created_at_gmt DESC LIMIT 50", // Get latest 50 payments
+            $user_id
+        ), ARRAY_A);
 
-        // --- Step 3: Generate Nonce for Subscription AJAX ---
-        $nonce = wp_create_nonce(EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_nonce');
 
-        // --- Step 4: Generate HTML using Output Buffering ---
+        // --- Start Output Buffering ---
         ob_start();
 ?>
+        <div class="edel-stripe-my-account-wrap">
+
+            <h2>ご契約情報</h2>
+
+            <?php if (!empty($stripe_error_message)): ?>
+                <div class="notice notice-error inline">
+                    <p><?php echo esc_html($stripe_error_message); ?></p>
+                </div>
+            <?php endif; ?>
+
+            <?php if ($subscription_id) : ?>
+                <table class="edel-stripe-my-account-details form-table"> <?php // Use WP classes for styling consistency
+                                                                            ?>
+                    <tbody>
+                        <tr>
+                            <th>ステータス</th>
+                            <td>
+                                <?php
+                                // Display status with color coding (using latest from Stripe)
+                                $status_label = ucfirst($current_status_from_stripe ?: '不明');
+                                $color = '#777';
+                                if (in_array($current_status_from_stripe, ['active', 'trialing'])) {
+                                    $color = 'green';
+                                } elseif (in_array($current_status_from_stripe, ['canceled', 'incomplete_expired', 'unpaid'])) {
+                                    $color = 'red';
+                                } elseif (in_array($current_status_from_stripe, ['past_due', 'payment_failed', 'incomplete'])) {
+                                    $color = 'orange';
+                                }
+                                echo '<span style="color:' . esc_attr($color) . '; font-weight: bold;">' . esc_html($status_label) . '</span>';
+                                echo esc_html($cancel_at_str); // Display cancellation scheduled date if set
+                                ?>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th>プラン内容</th>
+                            <td><?php echo wp_kses_post($plan_details_str); // Allow basic HTML if needed, otherwise esc_html
+                                ?></td>
+                        </tr>
+                        <tr>
+                            <th>次回お支払い日</th>
+                            <td><?php echo esc_html($next_billing_str); ?></td>
+                        </tr>
+                        <tr>
+                            <th>StripeサブスクリプションID</th>
+                            <td><code><?php echo esc_html($subscription_id); ?></code></td>
+                        </tr>
+                        <?php // Show cancel button only if subscription is active/trialing/past_due etc. and NOT already scheduled for cancellation
+                        ?>
+                        <?php if (!in_array($current_status_from_stripe, ['canceled', 'incomplete_expired', 'unpaid']) && !$stripe_subscription?->cancel_at_period_end): ?>
+                            <tr>
+                                <th>操作</th>
+                                <td>
+                                    <?php $cancel_nonce = wp_create_nonce(EDEL_STRIPE_PAYMENT_PREFIX . 'user_cancel_sub_' . $subscription_id); ?>
+                                    <form id="edel-stripe-user-cancel-form" style="margin: 0;">
+                                        <input type="hidden" name="action" value="edel_stripe_user_cancel_subscription">
+                                        <input type="hidden" name="subscription_id" value="<?php echo esc_attr($subscription_id); ?>">
+                                        <input type="hidden" name="security" value="<?php echo esc_attr($cancel_nonce); ?>">
+                                        <button type="submit" class="button edel-stripe-user-cancel-button">サブスクリプションをキャンセル</button>
+                                        <span class="spinner" style="display: none; vertical-align: middle; margin-left: 5px;"></span>
+                                    </form>
+                                    <div class="cancel-result" style="margin-top: 10px;"></div>
+                                    <p><small>キャンセルした場合、通常は現在の請求期間の終了時に停止します。</small></p>
+                                </td>
+                            </tr>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+
+            <?php else : ?>
+                <p>現在、有効なサブスクリプション契約はありません。</p>
+            <?php endif; ?>
+
+            <hr style="margin: 30px 0;">
+
+            <h2>決済履歴</h2>
+            <div id="edel-stripe-payment-history-list">
+                <?php if (!empty($payments)): ?>
+                    <table class="wp-list-table widefat striped edel-stripe-history-table">
+                        <thead>
+                            <tr>
+                                <?php // ★ th にクラスを追加 (任意)
+                                ?>
+                                <th scope="col" class="history-date">日時</th>
+                                <th scope="col" class="history-item">内容</th>
+                                <th scope="col" class="history-amount">金額</th>
+                                <th scope="col" class="history-status">ステータス</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($payments as $payment): ?>
+                                <tr>
+                                    <?php // ★ td にクラスを追加 (任意)
+                                    ?>
+                                    <td class="history-date">
+                                        <?php echo isset($payment['created_at_gmt']) ? esc_html(wp_date(get_option('date_format') . ' ' . get_option('time_format'), strtotime($payment['created_at_gmt']))) : '---'; ?>
+                                    </td>
+                                    <td class="history-item">
+                                        <?php echo esc_html($payment['item_name'] ?? ''); ?>
+                                        <?php if (!empty($payment['subscription_id'])): // サブスク支払いならID表示
+                                        ?>
+                                            <br><small>Sub: <?php echo esc_html($payment['subscription_id']); ?></small>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td class="history-amount">
+                                        <?php
+                                        // ... (金額フォーマット処理 - 変更なし) ...
+                                        $p_amount = $payment['amount'] ?? 0;
+                                        $p_currency = strtolower($payment['currency'] ?? 'jpy');
+                                        if ($p_currency === 'jpy') {
+                                            echo number_format($p_amount) . '円';
+                                        } elseif ($p_currency === 'usd') {
+                                            echo '$' . number_format($p_amount / 100, 2);
+                                        } else {
+                                            echo number_format($p_amount) . ' ' . strtoupper($p_currency);
+                                        }
+                                        ?>
+                                    </td>
+                                    <td class="history-status">
+                                        <?php // ステータスに応じて色付けなど可能
+                                        $p_status = $payment['status'] ?? '不明';
+                                        echo esc_html(ucfirst($p_status));
+                                        ?>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                <?php else: ?>
+                    <p>決済履歴はありません。</p>
+                <?php endif; ?>
+            </div>
+
+        </div><?php
+                return ob_get_clean();
+            } // end render_my_account_page
+
+            /**
+             * ★新規追加: AJAX handler for user cancelling their own subscription (Skeleton).
+             */
+            public function ajax_user_cancel_subscription() {
+                // Check if user is logged in
+                if (!is_user_logged_in()) {
+                    wp_send_json_error(['message' => 'ログインが必要です。'], 403);
+                    return;
+                }
+
+                // Get Subscription ID from POST
+                $sub_id = isset($_POST['subscription_id']) ? sanitize_text_field($_POST['subscription_id']) : '';
+
+                // Check Nonce (Action name includes sub ID)
+                check_ajax_referer(EDEL_STRIPE_PAYMENT_PREFIX . 'user_cancel_sub_' . $sub_id, 'security');
+
+                // Get current user ID
+                $user_id = get_current_user_id();
+
+                // --- Verify Ownership ---
+                $user_sub_id = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_id', true);
+                if (empty($sub_id) || empty($user_sub_id) || $user_sub_id !== $sub_id) {
+                    error_log("[Edel Stripe User Cancel] Attempt to cancel non-owned/invalid sub. User: {$user_id}, Sub attempted: {$sub_id}, User's actual sub: {$user_sub_id}");
+                    wp_send_json_error(['message' => 'キャンセル対象のサブスクリプションが見つかりません。'], 403);
+                    return;
+                }
+
+                // Get Stripe Secret Key
+                $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+                $is_live_mode = isset($options['mode']) && $options['mode'] === 'live';
+                $secret_key = $is_live_mode ? ($options['live_secret_key'] ?? '') : ($options['test_secret_key'] ?? '');
+                $error_log_prefix = '[Edel Stripe User Cancel] ';
+
+                if (empty($secret_key)) {
+                    error_log($error_log_prefix . 'Stripe Secret Key not configured.');
+                    wp_send_json_error(['message' => 'サーバーエラーが発生しました (コード: KNF)。']); // Generic error
+                    return;
+                }
+
+                error_log($error_log_prefix . 'User ID ' . $user_id . ' requested cancellation for SubID: ' . $sub_id);
+
+                try {
+                    // --- Initialize Stripe Client ---
+                    $stripe = new \Stripe\StripeClient($secret_key);
+                    \Stripe\Stripe::setApiVersion("2024-04-10"); // Set API version
+
+                    // --- Cancel the subscription immediately using StripeClient ---
+                    $subscription = $stripe->subscriptions->cancel($sub_id, []); // Empty array for params
+
+                    error_log($error_log_prefix . 'Subscription cancellation processed via StripeClient for: ' . $sub_id . '. Result Status: ' . $subscription->status);
+
+                    // We rely on the webhook 'customer.subscription.deleted/updated' to update the WP status/role.
+                    // Send success message back to the user's browser.
+                    wp_send_json_success([
+                        'message' => 'サブスクリプションのキャンセル手続きを受け付けました。契約状況はまもなく更新されます。'
+                    ]);
+                } catch (\Stripe\Exception\ApiErrorException $e) {
+                    error_log($error_log_prefix . 'Stripe API Error user canceling subscription ' . $sub_id . ': ' . $e->getMessage());
+                    // Check if already canceled
+                    if (strpos($e->getMessage(), 'No such subscription') !== false || strpos($e->getMessage(), 'subscription is already canceled') !== false) {
+                        wp_send_json_success(['message' => 'サブスクリプションは既にキャンセルされています。']); // Treat as success from user perspective
+                    } else {
+                        wp_send_json_error(['message' => 'Stripe APIエラー: ' . esc_html($e->getMessage())]);
+                    }
+                } catch (Exception $e) {
+                    error_log($error_log_prefix . 'General Error user canceling subscription ' . $sub_id . ': ' . $e->getMessage());
+                    wp_send_json_error(['message' => 'キャンセル処理中にエラーが発生しました。']);
+                }
+
+                // wp_send_json_* includes wp_die()
+            } // end ajax_user_cancel_subscription
+
+            /**
+             * Handles incoming Stripe Webhook events.
+             * Verifies the signature and processes the event.
+             *
+             * @param WP_REST_Request $request The request object.
+             * @return WP_REST_Response Response object.
+             */
+            public function handle_webhook(WP_REST_Request $request) {
+                $payload = $request->get_body();
+                $sig_header = $request->get_header('stripe_signature');
+                $event = null;
+                $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+                $endpoint_secret_test = $options['test_webhook_secret'] ?? '';
+                $endpoint_secret_live = $options['live_webhook_secret'] ?? '';
+                $error_log_prefix = '[Edel Stripe Webhook] ';
+
+                error_log($error_log_prefix . 'Received webhook request.');
+
+                // --- Signature Verification ---
+                if (empty($sig_header)) {
+                    error_log($error_log_prefix . 'Missing signature.');
+                    return new WP_REST_Response(['error' => 'Missing signature'], 400);
+                }
+                if (empty($endpoint_secret_test) && empty($endpoint_secret_live)) {
+                    error_log($error_log_prefix . 'Secret not configured.');
+                    return new WP_REST_Response(['error' => 'Webhook secret not configured'], 500);
+                }
+                $endpoint_secret = !empty($endpoint_secret_test) ? $endpoint_secret_test : $endpoint_secret_live;
+                if (empty($endpoint_secret)) {
+                    error_log($error_log_prefix . 'Both secrets empty.');
+                    return new WP_REST_Response(['error' => 'Webhook secret not configured'], 500);
+                }
+
+                try {
+                    $event = \Stripe\Webhook::constructEvent($payload, $sig_header, $endpoint_secret);
+                    $correct_secret = $event->livemode ? $endpoint_secret_live : $endpoint_secret_test;
+                    if (empty($correct_secret)) {
+                        throw new \Stripe\Exception\SignatureVerificationException('Appropriate secret not configured.', $sig_header, $payload);
+                    }
+                    if ($correct_secret !== $endpoint_secret) {
+                        $event = \Stripe\Webhook::constructEvent($payload, $sig_header, $correct_secret);
+                    }
+                    $mode_used = $event->livemode ? 'Live' : 'Test';
+                    error_log($error_log_prefix . 'Signature verified (' . $mode_used . '). Event ID: ' . $event->id . ' Type: ' . $event->type);
+                } catch (\Exception $e) {
+                    error_log($error_log_prefix . 'Webhook Setup Error: ' . $e->getMessage());
+                    return new WP_REST_Response(['error' => 'Webhook signature error.'], 400);
+                }
+
+                // --- Handle the event based on its type ---
+                global $wpdb;
+                $payment_table_name = $wpdb->prefix . EDEL_STRIPE_PAYMENT_PREFIX . 'main';
+                $processed = false; // Flag
+
+                try {
+                    $object = $event->data->object; // Main object from the event data
+                    $customer_id = null;
+                    // Attempt to reliably get the customer ID from various event object structures
+                    if (isset($object->customer)) {
+                        $customer_id = $object->customer;
+                    } elseif (isset($object->id) && strpos($object->id, 'cus_') === 0) {
+                        $customer_id = $object->id;
+                    } elseif (isset($object->data->object->customer)) {
+                        $customer_id = $object->data->object->customer;
+                    } elseif (isset($object->customer_email)) { /* Could try lookup by email if needed, but less reliable */
+                    }
+
+                    $user = null;
+                    $user_id = null;
+                    $user_email = null;
+                    if ($customer_id) {
+                        $user = $this->get_user_by_stripe_customer_id($customer_id);
+                    }
+                    if ($user) {
+                        $user_id = $user->ID;
+                        $user_email = $user->user_email;
+                    } else {
+                        error_log($error_log_prefix . "User could not be found for Customer ID: " . ($customer_id ?? 'N/A') . " in event type " . $event->type);
+                    }
+
+                    // Base notification data (can be added to within each case)
+                    $notification_data = [
+                        'customer_id' => $customer_id,
+                        'user_id' => $user_id,
+                        'user_email' => $user_email,
+                        'event_type' => $event->type,
+                        'event_id' => $event->id,
+                    ];
+
+                    switch ($event->type) {
+
+                        case 'invoice.payment_succeeded':
+                            $invoice = $object;
+                            if (isset($invoice->subscription) && !empty($invoice->subscription) && $invoice->billing_reason === 'subscription_cycle') {
+                                $subscription_id = $invoice->subscription;
+                                error_log($error_log_prefix . 'Processing ' . $event->type . ' for SubID: ' . $subscription_id);
+                                if ($user) { // Proceed only if user is found
+                                    $payment_intent_id = $invoice->payment_intent;
+                                    $amount_paid = $invoice->amount_paid;
+                                    $currency = $invoice->currency;
+                                    $plan_id = $invoice->lines->data[0]->price->id ?? null;
+                                    $item_name = 'Subscription Recurring Payment (' . ($plan_id ?: $subscription_id) . ')';
+
+                                    // 1. Record payment in custom table
+                                    $data_to_insert = [
+                                        'user_id' => $user_id,
+                                        'payment_intent_id' => $payment_intent_id ?? ('invoice_' . $invoice->id),
+                                        'customer_id' => $customer_id,
+                                        'subscription_id' => $subscription_id,
+                                        'status' => 'succeeded',
+                                        'amount' => $amount_paid,
+                                        'currency' => $currency,
+                                        'item_name' => $item_name,
+                                        'created_at_gmt' => gmdate('Y-m-d H:i:s', $invoice->created),
+                                        'updated_at_gmt' => gmdate('Y-m-d H:i:s', time()),
+                                        'metadata' => maybe_serialize(['plan_id' => $plan_id, 'invoice_id' => $invoice->id, 'billing_reason' => $invoice->billing_reason])
+                                    ];
+                                    $data_formats = ['%d', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s'];
+                                    $inserted = $wpdb->insert($payment_table_name, $data_to_insert, $data_formats);
+                                    if ($inserted === false) {
+                                        error_log($error_log_prefix . "Failed recurring payment DB insert. Error: " . $wpdb->last_error);
+                                    } else {
+                                        error_log($error_log_prefix . "Recurring payment recorded for UserID: {$user_id}");
+                                    }
+
+                                    // 2. Ensure status and role are active
+                                    update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', 'active');
+                                    $subscriber_role = $options['sub_subscriber_role'] ?? null;
+                                    if ($subscriber_role && get_role($subscriber_role)) {
+                                        $user_obj = new WP_User($user_id);
+                                        if (!$user_obj->has_cap($subscriber_role)) {
+                                            $user_obj->set_role($subscriber_role);
+                                            error_log($error_log_prefix . "Role '{$subscriber_role}' ensured for UserID: {$user_id}");
+                                        }
+                                    }
+                                    $processed = true;
+                                }
+                            } else {
+                                $processed = true;
+                                error_log($error_log_prefix . "Ignoring " . $event->type . " - Reason: " . ($invoice->billing_reason ?? 'N/A'));
+                            }
+                            break;
+
+                        case 'customer.subscription.deleted':
+                            $subscription = $object;
+                            error_log($error_log_prefix . 'Processing ' . $event->type . ' for SubID: ' . $subscription->id);
+                            if ($user) {
+                                // Update meta and role
+                                update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', 'canceled');
+                                $subscriber_role = $options['sub_subscriber_role'] ?? null;
+                                if ($subscriber_role) {
+                                    $user_obj = new WP_User($user_id);
+                                    if ($user_obj->has_cap($subscriber_role)) {
+                                        $user_obj->remove_role($subscriber_role);
+                                        error_log($error_log_prefix . "Removed role '{$subscriber_role}' for UserID: {$user_id}");
+                                    }
+                                } else {
+                                    error_log($error_log_prefix . "No role set for UserID: {$user_id}");
+                                }
+                                error_log($error_log_prefix . "Set meta status to 'canceled' for UserID: {$user_id}");
+
+                                // Prepare data for email
+                                $notification_data['subscription_id'] = $subscription->id;
+                                $notification_data['plan_id'] = $subscription->items->data[0]->price->id ?? null;
+                                $notification_data['item_name'] = 'Subscription (' . ($notification_data['plan_id'] ?: $subscription->id) . ')'; // Basic name
+                                try {
+                                    if ($notification_data['plan_id'] && \Stripe\Stripe::getApiKey()) {
+                                        $price = \Stripe\Price::retrieve($notification_data['plan_id'], ['expand' => ['product']]);
+                                        if ($price->product && is_object($price->product)) $notification_data['item_name'] = $price->product->name;
+                                    }
+                                } catch (Exception $e) {
+                                }
+
+                                error_log($error_log_prefix . 'Data before sending cancel notification: ' . print_r($notification_data, true));
+
+                                // Send cancellation notification email
+                                $this->send_webhook_or_signup_notification('subscription_canceled', $notification_data);
+                                $processed = true;
+                            }
+                            break;
+
+                        case 'invoice.payment_failed':
+                            $invoice = $object;
+                            if (isset($invoice->subscription) && !empty($invoice->subscription)) {
+                                error_log($error_log_prefix . 'Processing ' . $event->type . ' for SubID: ' . $invoice->subscription);
+                                if ($user) {
+                                    // Update meta status
+                                    update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', 'payment_failed'); // Or use 'past_due' if invoice.paid is false? check Stripe docs
+                                    error_log($error_log_prefix . "Set user meta status to 'payment_failed' for UserID: {$user_id}");
+
+                                    // Prepare data for email
+                                    $notification_data['subscription_id'] = $invoice->subscription;
+                                    $notification_data['plan_id'] = $invoice->lines->data[0]->price->id ?? null;
+                                    $notification_data['amount'] = $invoice->amount_due;
+                                    $notification_data['currency'] = $invoice->currency;
+                                    $notification_data['item_name'] = 'Subscription (' . ($notification_data['plan_id'] ?: $invoice->subscription) . ')'; // Basic name
+                                    try {
+                                        if ($notification_data['plan_id'] && \Stripe\Stripe::getApiKey()) {
+                                            $price = \Stripe\Price::retrieve($notification_data['plan_id'], ['expand' => ['product']]);
+                                            if ($price->product && is_object($price->product)) $notification_data['item_name'] = $price->product->name;
+                                        }
+                                    } catch (Exception $e) {
+                                    }
+
+                                    // Send payment failed notification email
+                                    $this->send_webhook_or_signup_notification('payment_failed', $notification_data);
+                                    $processed = true;
+                                }
+                            } else {
+                                $processed = true; /* Ignored */
+                            }
+                            break;
+
+                        case 'customer.subscription.updated':
+                            $subscription = $object;
+                            error_log($error_log_prefix . 'Processing ' . $event->type . ' for SubID: ' . $subscription->id . ' New Status: ' . $subscription->status);
+                            if ($user) {
+                                $new_status = $subscription->status;
+                                // Update user meta status
+                                update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', $new_status);
+                                error_log($error_log_prefix . "Updated user meta status to '{$new_status}' for UserID: {$user_id}");
+                                // Update user role based on new status
+                                $subscriber_role = $options['sub_subscriber_role'] ?? null;
+                                if ($subscriber_role && get_role($subscriber_role)) {
+                                    $user_obj = new WP_User($user_id);
+                                    $active_statuses = ['active', 'trialing'];
+                                    if (in_array($new_status, $active_statuses)) {
+                                        if (!$user_obj->has_cap($subscriber_role)) {
+                                            $user_obj->set_role($subscriber_role);
+                                            error_log($error_log_prefix . "Assigned role '{$subscriber_role}' for UserID {$user_id}");
+                                        }
+                                    } else {
+                                        if ($user_obj->has_cap($subscriber_role)) {
+                                            $user_obj->remove_role($subscriber_role);
+                                            error_log($error_log_prefix . "Removed role '{$subscriber_role}' for UserID {$user_id}");
+                                        }
+                                    }
+                                }
+                                $processed = true;
+                            }
+                            break;
+
+                        case 'charge.refunded':
+                            $charge = $object;
+                            $pi_id = $charge->payment_intent;
+                            if (empty($pi_id)) {
+                                $processed = true;
+                                break;
+                            }
+                            error_log($error_log_prefix . 'Processing ' . $event->type . ' for PI ID: ' . $pi_id);
+                            $payment_record = $wpdb->get_row($wpdb->prepare("SELECT id, status FROM {$payment_table_name} WHERE payment_intent_id = %s", $pi_id));
+                            if ($payment_record) {
+                                $new_status = 'refunded';
+                                if ($payment_record->status !== $new_status) {
+                                    $updated = $wpdb->update($payment_table_name, ['status' => $new_status, 'updated_at_gmt' => current_time('mysql', 1)], ['payment_intent_id' => $pi_id], ['%s', '%s'], ['%s']);
+                                    if ($updated !== false) {
+                                        error_log($error_log_prefix . "Updated payment status to '{$new_status}' for PI: " . $pi_id);
+                                    } else {
+                                        error_log($error_log_prefix . "Failed update payment status for PI: " . $pi_id . ". DB Error: " . $wpdb->last_error);
+                                    }
+                                } else {
+                                    error_log($error_log_prefix . "Payment status already '{$new_status}' for PI: " . $pi_id);
+                                }
+                                // TODO: Send refund notification email?
+                                $processed = true;
+                            } else {
+                                error_log($error_log_prefix . "Payment record not found for PI ID: " . $pi_id);
+                            }
+                            break;
+
+                        default:
+                            error_log('[Edel Stripe Webhook] Received unhandled event type: ' . $event->type);
+                            $processed = true; // Acknowledge
+                    } // end switch
+
+                } catch (Exception $e) {
+                    error_log('[Edel Stripe Webhook] Error processing event (' . ($event->id ?? 'N/A') . ' Type: ' . ($event->type ?? 'N/A') . '): ' . $e->getMessage());
+                    return new WP_REST_Response(['error' => 'Webhook event processing error: ' . $e->getMessage()], 500); // Return specific error
+                }
+
+                // Return 200 OK
+                return new WP_REST_Response(['received' => true, 'processed' => $processed], 200);
+            } // end handle_webhook
+
+            /**
+             * Sends specific emails based on context (signup or webhook event).
+             * Uses settings for templates, sender info, toggles, and replaces placeholders.
+             *
+             * @param string $context        Context key (e.g., 'signup_onetime', 'signup_subscription', 'payment_failed', 'subscription_canceled').
+             * @param array  $data           Data for placeholders (must include 'user_email' if sending to customer; other keys depend on context).
+             * @param bool   $is_new_user    (Optional) Whether a new WP user was created (relevant for signup context).
+             */
+            private function send_webhook_or_signup_notification($context, $data, $is_new_user = false, $customer_email = null) {
+                $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+                $error_log_prefix = '[Edel Stripe Notify ' . $context . '] '; // Add context to log prefix
+
+                error_log($error_log_prefix . 'Received Customer Email Parameter: ' . print_r($customer_email, true));
+
+                // --- 1. Get Common Settings ---
+                $default_from_name = get_bloginfo('name');
+                $default_from_email = get_option('admin_email');
+                $mail_from_name = $options['mail_from_name'] ?? $default_from_name;
+                $mail_from_email = $options['mail_from_email'] ?? $default_from_email;
+                $admin_notify_email = $options['admin_notify_email'] ?? $default_from_email;
+
+                // --- 2. Determine Templates and Send Toggles based on Context ---
+                $send_admin = false;
+                $admin_subject_template = '';
+                $admin_body_template = '';
+                $send_customer = false;
+                $customer_subject_template = '';
+                $customer_body_template = '';
+
+                switch ($context) {
+                    case 'signup_onetime':
+                        $send_admin = true; // Always notify admin on new one-time payment
+                        $send_customer = $options['ot_send_customer_email'] ?? '0';
+                        $admin_subject_template = $options['ot_admin_mail_subject'] ?? '[{site_name}] 新しい決済がありました(買い切り)';
+                        $admin_body_template = $options['ot_admin_mail_body'] ?? "買い切り決済完了。\nEmail:{customer_email}\nItem:{item_name}\nAmount:{amount}\nDate:{transaction_date}\nUserID:{user_id}\nPI:{payment_intent_id}\nCusID:{customer_id}";
+                        $customer_subject_template = $options['ot_customer_mail_subject'] ?? '[{site_name}] ご購入ありがとうございます';
+                        $customer_body_template = $options['ot_customer_mail_body'] ?? "{user_name}様\n「{item_name}」({amount})のご購入ありがとうございます。\nDate:{transaction_date}\n--\n{site_name}";
+                        break;
+                    case 'signup_subscription':
+                        $send_admin = true; // Always notify admin on new subscription
+                        $send_customer = $options['sub_send_customer_email'] ?? '0';
+                        $admin_subject_template = $options['sub_admin_mail_subject'] ?? '[{site_name}] 新規サブスク申込';
+                        $admin_body_template = $options['sub_admin_mail_body'] ?? "サブスク申込。\nEmail:{customer_email}\nPlan:{item_name}({plan_id})\nCusID:{customer_id}\nSubID:{subscription_id}\nUserID:{user_id}";
+                        $customer_subject_template = $options['sub_customer_mail_subject'] ?? '[{site_name}] サブスクへようこそ';
+                        $customer_body_template = $options['sub_customer_mail_body'] ?? "{user_name}様\nサブスク「{item_name}」申込ありがとうございます。\n--\n{site_name}";
+                        break;
+                    case 'payment_failed':
+                        $send_admin = $options['sub_fail_send_admin'] ?? '1'; // Use toggle from settings
+                        $admin_subject_template = $options['sub_fail_admin_subject'] ?? '[{site_name}] 支払い失敗通知(Admin)';
+                        $admin_body_template = $options['sub_fail_admin_body'] ?? "支払い失敗。\nEmail:{customer_email}\nSubID:{subscription_id}\nPlan:{item_name}({plan_id})";
+                        $send_customer = $options['sub_fail_send_customer'] ?? '1'; // Use toggle from settings
+                        $customer_subject_template = $options['sub_fail_customer_subject'] ?? '[{site_name}] お支払い情報確認依頼';
+                        $customer_body_template = $options['sub_fail_customer_body'] ?? "{user_name}様\nサブスク「{item_name}」の支払失敗。カード情報更新を。";
+                        break;
+                    case 'subscription_canceled':
+                        $send_admin = $options['sub_cancel_send_admin'] ?? '1'; // Use toggle from settings
+                        $admin_subject_template = $options['sub_cancel_admin_subject'] ?? '[{site_name}] サブスクキャンセル通知(Admin)';
+                        $admin_body_template = $options['sub_cancel_admin_body'] ?? "キャンセル。\nEmail:{customer_email}\nSubID:{subscription_id}\nPlan:{item_name}({plan_id})";
+                        $send_customer = $options['sub_cancel_send_customer'] ?? '1'; // Use toggle from settings
+                        $customer_subject_template = $options['sub_cancel_customer_subject'] ?? '[{site_name}] サブスク解約のお知らせ';
+                        $customer_body_template = $options['sub_cancel_customer_body'] ?? "{user_name}様\n「{item_name}」の解約完了。";
+                        break;
+                    // Add more cases like 'payment_refunded' if needed
+                    default:
+                        error_log($error_log_prefix . 'Unknown notification context: ' . $context);
+                        return; // Unknown context, do nothing
+                }
+
+                // Validate recipient emails
+                if (!is_email($admin_notify_email)) {
+                    $send_admin = false;
+                    error_log($error_log_prefix . 'Invalid admin notify email.');
+                }
+                $is_valid_customer_email = is_email($customer_email);
+                if (!$is_valid_customer_email) {
+                    $send_customer = false; // Disable sending if email is invalid
+                    error_log($error_log_prefix . 'Invalid customer email passed. Will not send customer email.');
+                } else {
+                    error_log($error_log_prefix . 'Customer email is valid. Send flag from settings: ' . $send_customer);
+                }
+                // --- Step 3: Prepare Placeholders and Values ---
+                $user_display_name = $customer_email;
+                $user_id_display = 'N/A';
+                if (!empty($data['user_id'])) {
+                    $user_id_display = $data['user_id'];
+                    $user_info = get_userdata($data['user_id']);
+                    if ($user_info && !empty($user_info->display_name)) {
+                        $user_display_name = $user_info->display_name;
+                    }
+                }
+                // Use current time for webhook events, or payment time for signups
+                $transaction_timestamp = ($context === 'signup_onetime' || $context === 'signup_subscription') && isset($data['created_at_gmt'])
+                    ? strtotime($data['created_at_gmt']) : time();
+                $amount_raw = $data['amount'] ?? 0;
+                $currency = strtolower($data['currency'] ?? 'jpy');
+                // Format amount based on currency
+                $formatted_amount = '';
+                if ($currency === 'jpy') {
+                    $formatted_amount = number_format($amount_raw) . '円';
+                } elseif ($currency === 'usd') {
+                    $formatted_amount = '$' . number_format($amount_raw / 100, 2);
+                } else {
+                    $formatted_amount = number_format($amount_raw) . ' ' . strtoupper($currency);
+                }
+                // Get Plan ID from metadata if available in data array
+                $metadata = maybe_unserialize($data['metadata'] ?? '');
+                $plan_id_from_meta = $metadata['plan_id'] ?? ($data['plan_id'] ?? 'N/A');
+
+                $replacements = [
+                    '{item_name}'         => $data['item_name'] ?? '',
+                    '{amount}'            => $formatted_amount,
+                    '{customer_email}'    => $customer_email ?? '',
+                    '{payment_intent_id}' => $data['payment_intent_id'] ?? 'N/A',
+                    '{customer_id}'       => $data['customer_id'] ?? 'N/A',
+                    '{transaction_date}'  => wp_date(get_option('date_format') . ' ' . get_option('time_format'), $transaction_timestamp),
+                    '{user_name}'         => $user_display_name,
+                    '{user_id}'           => $user_id_display,
+                    '{site_name}'         => wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES),
+                    '{site_url}'          => home_url(),
+                    '{subscription_id}'   => $data['subscription_id'] ?? 'N/A',
+                    '{plan_id}'           => $plan_id_from_meta,
+                ];
+
+                // --- Step 4: Prepare Headers (using filters) ---
+                $use_custom_from = !empty($mail_from_email) && is_email($mail_from_email);
+                $final_from_name = $use_custom_from ? $mail_from_name : $default_from_name;
+                $final_from_email = $use_custom_from ? $mail_from_email : $default_from_email;
+                $set_from_name = function ($original) use ($final_from_name) {
+                    return $final_from_name;
+                };
+                $set_from_email = function ($original) use ($final_from_email) {
+                    return $final_from_email;
+                };
+                $set_content_type = function () {
+                    return 'text/plain';
+                };
+
+                add_filter('wp_mail_from_name', $set_from_name);
+                add_filter('wp_mail_from', $set_from_email);
+                add_filter('wp_mail_content_type', $set_content_type);
+
+                // --- Step 5: Send Admin Notification ---
+                if ($send_admin && !empty($admin_notify_email)) {
+                    if (!is_string($admin_subject_template)) $admin_subject_template = "Stripe Alert: " . $context; // Fallback
+                    if (!is_string($admin_body_template)) $admin_body_template = "Event: " . $context . "\nData: " . print_r($data, true); // Fallback
+                    $admin_subject = str_replace(array_keys($replacements), array_values($replacements), $admin_subject_template);
+                    $admin_message_raw = str_replace(array_keys($replacements), array_values($replacements), $admin_body_template);
+                    $admin_message = str_replace(["\r\n", "\r"], "\n", $admin_message_raw);
+                    $admin_message = str_replace("\n", "\r\n", $admin_message);
+                    if (!wp_mail($admin_notify_email, $admin_subject, $admin_message)) {
+                        error_log($error_log_prefix . 'Admin email failed.');
+                    } else {
+                        error_log($error_log_prefix . "Admin notification sent.");
+                    }
+                }
+
+                // --- Step 6: Send Customer Notification ---
+                if ($send_customer && !empty($customer_email)) {
+                    if (!is_string($customer_subject_template)) $customer_subject_template = "Update from {site_name}"; // Fallback
+                    if (!is_string($customer_body_template)) $customer_body_template = "Your account status has been updated."; // Fallback
+                    $customer_subject = str_replace(array_keys($replacements), array_values($replacements), $customer_subject_template);
+                    $customer_message_raw = str_replace(array_keys($replacements), array_values($replacements), $customer_body_template);
+                    if ($is_new_user && ($context === 'signup_onetime' || $context === 'signup_subscription')) {
+                        $customer_message_raw .= "\n\n---\nアカウント情報について...\n";
+                    }
+                    $customer_message = str_replace(["\r\n", "\r"], "\n", $customer_message_raw);
+                    $customer_message = str_replace("\n", "\r\n", $customer_message);
+                    if (!wp_mail($customer_email, $customer_subject, $customer_message)) {
+                        error_log($error_log_prefix . 'Customer email failed: ' . $customer_email);
+                    } else {
+                        error_log($error_log_prefix . "Customer notification sent to " . $customer_email);
+                    }
+                }
+
+                // --- Step 7: Clean up filters ---
+                remove_filter('wp_mail_from_name', $set_from_name);
+                remove_filter('wp_mail_from', $set_from_email);
+                remove_filter('wp_mail_content_type', $set_content_type);
+
+                error_log($error_log_prefix . 'Finished.');
+            } // end send_webhook_or_signup_notification
+
+            /**
+             * Sends specific emails based on webhook events or other contexts.
+             *
+             * @param string $context        Context key (e.g., 'payment_failed', 'subscription_canceled').
+             * @param array  $data           Data for placeholders (must include 'user_email' if sending to customer).
+             */
+            private function send_webhook_notification($context, $data) {
+                $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+                $error_log_prefix = '[Edel Stripe Notify] ';
+
+                // Get common settings
+                $default_from_name = get_bloginfo('name');
+                $default_from_email = get_option('admin_email');
+                $mail_from_name = $options['mail_from_name'] ?? $default_from_name;
+                $mail_from_email = $options['mail_from_email'] ?? $default_from_email;
+                $admin_notify_email = $options['admin_notify_email'] ?? $default_from_email;
+
+                // Determine which templates and toggles to use based on context
+                $send_admin = false;
+                $admin_subject_template = '';
+                $admin_body_template = '';
+                $send_customer = false;
+                $customer_subject_template = '';
+                $customer_body_template = '';
+                $customer_email = $data['user_email'] ?? null; // Get customer email from data
+
+                switch ($context) {
+                    case 'payment_failed':
+                        $send_admin = $options['sub_fail_send_admin'] ?? '1'; // Default ON
+                        $admin_subject_template = $options['sub_fail_admin_subject'] ?? '[{site_name}] サブスク支払い失敗通知';
+                        $admin_body_template = $options['sub_fail_admin_body'] ?? "支払い失敗: Email:{customer_email}, SubID:{subscription_id}";
+                        $send_customer = $options['sub_fail_send_customer'] ?? '1'; // Default ON
+                        $customer_subject_template = $options['sub_fail_customer_subject'] ?? '[{site_name}] お支払い情報の確認';
+                        $customer_body_template = $options['sub_fail_customer_body'] ?? "{user_name} 様\n支払い失敗。カード情報を確認・更新してください。";
+                        break;
+
+                    case 'subscription_canceled':
+                        $send_admin = $options['sub_cancel_send_admin'] ?? '1'; // Default ON
+                        $admin_subject_template = $options['sub_cancel_admin_subject'] ?? '[{site_name}] サブスクキャンセル通知';
+                        $admin_body_template = $options['sub_cancel_admin_body'] ?? "キャンセル: Email:{customer_email}, SubID:{subscription_id}";
+                        $send_customer = $options['sub_cancel_send_customer'] ?? '1'; // Default ON
+                        $customer_subject_template = $options['sub_cancel_customer_subject'] ?? '[{site_name}] サブスク解約のお知らせ';
+                        $customer_body_template = $options['sub_cancel_customer_body'] ?? "{user_name} 様\n「{item_name}」の解約完了。";
+                        break;
+
+                    // Add more cases for other notifications if needed (e.g., 'refund_processed')
+
+                    default:
+                        error_log($error_log_prefix . 'Unknown notification context: ' . $context);
+                        return; // Unknown context, do nothing
+                }
+
+                // Validate recipient emails
+                if (!is_email($admin_notify_email)) {
+                    $send_admin = false;
+                    error_log($error_log_prefix . 'Invalid admin notify email.');
+                }
+                if (!is_email($customer_email)) {
+                    $send_customer = false;
+                    error_log($error_log_prefix . 'Invalid customer email for notification.');
+                }
+
+                // Prepare placeholders (similar to previous function, use $data passed in)
+                $user_display_name = $customer_email;
+                $user_id_display = $data['user_id'] ?? 'N/A';
+                if (!empty($data['user_id'])) {
+                    $user_info = get_userdata($data['user_id']);
+                    if ($user_info && !empty($user_info->display_name)) {
+                        $user_display_name = $user_info->display_name;
+                    }
+                }
+                $transaction_timestamp = time(); // Use current time for notifications, or get from data if available
+                $amount_raw = $data['amount'] ?? 0;
+                $currency = strtolower($data['currency'] ?? 'jpy');
+                $formatted_amount = ''; // Format based on currency...
+                if ($currency === 'jpy') {
+                    $formatted_amount = number_format($amount_raw) . '円';
+                } elseif ($currency === 'usd') {
+                    $formatted_amount = '$' . number_format($amount_raw / 100, 2);
+                } else {
+                    $formatted_amount = number_format($amount_raw) . ' ' . strtoupper($currency);
+                }
+                $replacements = [
+                    '{item_name}' => $data['item_name'] ?? '',
+                    '{amount}' => $formatted_amount,
+                    '{customer_email}' => $customer_email,
+                    '{payment_intent_id}' => $data['payment_intent_id'] ?? 'N/A',
+                    '{customer_id}' => $data['customer_id'] ?? 'N/A',
+                    '{transaction_date}' => wp_date(get_option('date_format') . ' ' . get_option('time_format'), $transaction_timestamp),
+                    '{user_name}' => $user_display_name,
+                    '{user_id}' => $user_id_display,
+                    '{site_name}' => wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES),
+                    '{site_url}' => home_url(),
+                    '{subscription_id}' => $data['subscription_id'] ?? 'N/A',
+                    '{plan_id}' => $data['plan_id'] ?? 'N/A',
+                ];
+
+                // Prepare Headers
+                $use_custom_from = !empty($mail_from_email) && is_email($mail_from_email);
+                $final_from_name = $use_custom_from ? $mail_from_name : $default_from_name;
+                $final_from_email = $use_custom_from ? $mail_from_email : $default_from_email;
+                $set_from_name = function ($original) use ($final_from_name) {
+                    return $final_from_name;
+                };
+                $set_from_email = function ($original) use ($final_from_email) {
+                    return $final_from_email;
+                };
+                $set_content_type = function () {
+                    return 'text/plain';
+                };
+                add_filter('wp_mail_from_name', $set_from_name);
+                add_filter('wp_mail_from', $set_from_email);
+                add_filter('wp_mail_content_type', $set_content_type);
+
+                // Send Admin Email
+                if ($send_admin && !empty($admin_notify_email)) {
+                    if (!is_string($admin_subject_template)) $admin_subject_template = "Stripe Webhook Alert: " . $context; // Fallback subject
+                    if (!is_string($admin_body_template)) $admin_body_template = "Event: {event_type}\nData:\n" . print_r($data, true); // Fallback body
+                    $admin_subject = str_replace(array_keys($replacements), array_values($replacements), $admin_subject_template);
+                    $admin_message = str_replace(array_keys($replacements), array_values($replacements), $admin_body_template);
+                    $admin_message = str_replace(["\r\n", "\r"], "\n", $admin_message);
+                    $admin_message = str_replace("\n", "\r\n", $admin_message);
+                    if (!wp_mail($admin_notify_email, $admin_subject, $admin_message)) {
+                        error_log($error_log_prefix . 'Admin webhook email failed for context: ' . $context);
+                    } else {
+                        error_log($error_log_prefix . "Admin webhook notification sent for {$context} to " . $admin_notify_email);
+                    }
+                }
+
+                // Send Customer Email
+                if ($send_customer && !empty($customer_email)) {
+                    if (!is_string($customer_subject_template)) $customer_subject_template = "Regarding your account at {site_name}"; // Fallback
+                    if (!is_string($customer_body_template)) $customer_body_template = "Your account status has been updated."; // Fallback
+                    $customer_subject = str_replace(array_keys($replacements), array_values($replacements), $customer_subject_template);
+                    $customer_message = str_replace(array_keys($replacements), array_values($replacements), $customer_body_template);
+                    $customer_message = str_replace(["\r\n", "\r"], "\n", $customer_message);
+                    $customer_message = str_replace("\n", "\r\n", $customer_message);
+                    if (!wp_mail($customer_email, $customer_subject, $customer_message)) {
+                        error_log($error_log_prefix . 'Customer webhook email failed for context: ' . $context . ' to ' . $customer_email);
+                    } else {
+                        error_log($error_log_prefix . "Customer webhook notification sent for {$context} to " . $customer_email);
+                    }
+                }
+
+                // Clean up filters
+                remove_filter('wp_mail_from_name', $set_from_name);
+                remove_filter('wp_mail_from', $set_from_email);
+                remove_filter('wp_mail_content_type', $set_content_type);
+
+                error_log($error_log_prefix . 'Finished processing notification for context: ' . $context);
+            } // end send_webhook_notification
+
+            /**
+             * Enqueues frontend scripts and styles.
+             */
+            public function front_enqueue() {
+                // Load always for now
+                wp_enqueue_script('stripe-js', 'https://js.stripe.com/v3/', array(), null, true);
+
+                $version  = (defined('EDEL_STRIPE_PAYMENT_DEVELOP') && true === EDEL_STRIPE_PAYMENT_DEVELOP) ? time() : EDEL_STRIPE_PAYMENT_VERSION;
+                $strategy = array('in_footer' => true, 'strategy'  => 'defer');
+
+                wp_enqueue_style(EDEL_STRIPE_PAYMENT_SLUG . '-front', EDEL_STRIPE_PAYMENT_URL . '/css/front.css', array(), $version);
+                wp_enqueue_script(EDEL_STRIPE_PAYMENT_SLUG . '-front', EDEL_STRIPE_PAYMENT_URL . '/js/front.js', array('jquery', 'stripe-js'), $version, $strategy);
+
+                // Localize script - Pass data from PHP to JavaScript
+                $stripe_options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+                $is_live_mode = isset($stripe_options['mode']) && $stripe_options['mode'] === 'live';
+                $publishable_key = $is_live_mode ? ($stripe_options['live_publishable_key'] ?? '') : ($stripe_options['test_publishable_key'] ?? '');
+
+                // ★追加：フロント成功メッセージを取得（デフォルト値も考慮）
+                $default_success_message = "支払いが完了しました。ありがとうございます。\nメールをご確認ください。届いていない場合は、お問い合わせください。";
+                $frontend_success_message = $stripe_options['frontend_success_message'] ?? $default_success_message;
+
+                $params = array(
+                    'ajax_url' => admin_url('admin-ajax.php'),
+                    'publishable_key' => $publishable_key,
+                    'record_nonce' => wp_create_nonce(EDEL_STRIPE_PAYMENT_PREFIX . 'record_payment_nonce'),
+                    'success_message' => $frontend_success_message,
+                );
+                wp_localize_script(EDEL_STRIPE_PAYMENT_SLUG . '-front', 'edelStripeParams', $params);
+            }
+
+            public function render_subscription_shortcode($atts) {
+                // --- Step 1: Process Shortcode Attributes ---
+                $attributes = shortcode_atts(array(
+                    'plan_id'     => '', // Stripe Price ID (必須)
+                    'button_text' => '申し込む', // Default button text
+                ), $atts);
+
+                $plan_id = sanitize_text_field($attributes['plan_id']);
+                $button_text = sanitize_text_field($attributes['button_text']);
+
+                if (empty($plan_id) || strpos($plan_id, 'price_') !== 0) {
+                    if (current_user_can('manage_options')) {
+                        return '<p><span class="orange b">Edel Stripe Payment エラー: ショートコードに有効なプランID (plan_id="price_...") が指定されていません。</span></p>';
+                    } else {
+                        return '';
+                    }
+                }
+
+                // --- Step 2: Get Plugin Settings ---
+                $stripe_options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+                $require_consent = $stripe_options['require_consent'] ?? '1'; // Consent setting
+                // ★ 同意文言生成に必要な設定値を取得
+                $privacy_page_id = $stripe_options['privacy_page_id'] ?? 0;
+                $terms_page_id   = $stripe_options['terms_page_id'] ?? 0;
+                $consent_text_custom = $stripe_options['consent_text'] ?? '';
+                // Publishable key needed by JS (enqueued separately)
+
+                // --- Step 3: Generate Nonce for Subscription AJAX ---
+                $nonce = wp_create_nonce(EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_nonce');
+
+                // --- Step 4: Generate HTML using Output Buffering ---
+                ob_start();
+                ?>
         <div class="edel-stripe-payment-form-wrap" id="edel-stripe-subscription-form-wrap">
             <?php // Optional: Display Plan details
             ?>
@@ -670,7 +1405,9 @@ class EdelStripePaymentFront {
 
                 // --- Step 6: Send Plugin's Custom Notifications ---
                 if ($record_inserted) {
-                    $this->send_payment_notifications($data_to_insert, $email, $user_created);
+                    $is_subscription = !empty($data_to_insert['subscription_id']);
+                    $context = $is_subscription ? 'signup_subscription' : 'signup_onetime';
+                    $this->send_webhook_or_signup_notification($context, $data_to_insert, $user_created, $email);
                 }
 
                 // --- Step 7: Send Success Response to Frontend ---
@@ -893,162 +1630,19 @@ class EdelStripePaymentFront {
              * @param bool   $is_new_user    Whether a new WP user was created.
              */
             private function send_payment_notifications($payment_data, $customer_email, $is_new_user) {
-                // --- Step 1: Get Email Settings ---
-                $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+                $is_subscription = !empty($payment_data['subscription_id']);
+                $context = $is_subscription ? 'signup_subscription' : 'signup_onetime';
+                // Pass data to the unified handler
+                $this->send_webhook_or_signup_notification($context, $payment_data, $is_new_user);
+            } // end send_payment_notifications
 
-                // Common settings (From Name, From Email, Admin Recipient)
-                $default_from_name = get_bloginfo('name');
-                $default_from_email = get_option('admin_email');
-                $mail_from_name = $options['mail_from_name'] ?? $default_from_name;
-                $mail_from_email = $options['mail_from_email'] ?? $default_from_email;
-                $admin_notify_email = $options['admin_notify_email'] ?? $default_from_email;
-
-                // --- Step 2: Determine Payment Type and Get Specific Templates ---
-                $is_subscription = !empty($payment_data['subscription_id']); // Check if subscription ID exists
-
-                // Initialize template variables
-                $send_customer_email = '0';
-                $admin_subject_template = '';
-                $admin_body_template = '';
-                $customer_subject_template = '';
-                $customer_body_template = '';
-
-                // ★ 決済タイプに応じて読み込むオプションキーとデフォルト値を切り替える
-                if ($is_subscription) {
-                    // === Load Subscription Email Settings ===
-                    $send_customer_email = $options['sub_send_customer_email'] ?? '0';
-                    // Default templates for Subscription
-                    $default_admin_subject = '[{site_name}] 新しいサブスクリプション申込がありました';
-                    $default_admin_body = "サブスクリプション申込がありました。\n\n購入者Email: {customer_email}\nプラン: {item_name} ({plan_id})\n顧客ID: {customer_id}\nサブスクID: {subscription_id}\nUser ID: {user_id}";
-                    $default_customer_subject = '[{site_name}] サブスクリプションへようこそ';
-                    $default_customer_body = "{user_name} 様\n\nサブスクリプション「{item_name}」へのお申し込みありがとうございます。\n\nマイアカウントページから契約状況をご確認いただけます。\n\n--\n{site_name}\n{site_url}";
-                    // Get saved or default templates using 'sub_' prefixed keys
-                    $admin_subject_template    = $options['sub_admin_mail_subject'] ?? $default_admin_subject;
-                    $admin_body_template       = $options['sub_admin_mail_body'] ?? $default_admin_body;
-                    $customer_subject_template = $options['sub_customer_mail_subject'] ?? $default_customer_subject;
-                    $customer_body_template    = $options['sub_customer_mail_body'] ?? $default_customer_body;
-                } else {
-                    // === Load One-Time Payment Email Settings ===
-                    $send_customer_email = $options['ot_send_customer_email'] ?? '0';
-                    // Default templates for One-Time
-                    $default_admin_subject = '[{site_name}] 新しい決済がありました(買い切り)';
-                    $default_admin_body = "買い切り決済が完了しました。\n\n購入者Email: {customer_email}\n商品/内容: {item_name}\n金額: {amount}\n決済日時: {transaction_date}\n\nPayment Intent ID: {payment_intent_id}\nCustomer ID: {customer_id}\nWordPress User ID: {user_id}";
-                    $default_customer_subject = '[{site_name}] ご購入ありがとうございます';
-                    $default_customer_body = "{user_name} 様\n\n「{item_name}」のご購入ありがとうございます。\n金額: {amount}\n日時: {transaction_date}\n\n--\n{site_name}\n{site_url}";
-                    // Get saved or default templates using 'ot_' prefixed keys
-                    $admin_subject_template    = $options['ot_admin_mail_subject'] ?? $default_admin_subject;
-                    $admin_body_template       = $options['ot_admin_mail_body'] ?? $default_admin_body;
-                    $customer_subject_template = $options['ot_customer_mail_subject'] ?? $default_customer_subject;
-                    $customer_body_template    = $options['ot_customer_mail_body'] ?? $default_customer_body;
-                }
-
-                // Validate recipient emails
-                if (!is_email($admin_notify_email)) {
-                    $admin_notify_email = get_option('admin_email'); /* log error */
-                }
-                if (!is_email($customer_email)) {
-                    $send_customer_email = '0'; /* log error */
-                }
-
-                // --- Step 3: Prepare Placeholders and Values ---
-                // (通貨フォーマット処理を含む - 変更なし)
-                $user_display_name = $customer_email;
-                $user_id_display = 'N/A';
-                if (!empty($payment_data['user_id'])) {
-                    $user_id_display = $payment_data['user_id'];
-                    $user_info = get_userdata($payment_data['user_id']);
-                    if ($user_info && !empty($user_info->display_name)) {
-                        $user_display_name = $user_info->display_name;
-                    }
-                }
-                $transaction_timestamp = isset($payment_data['created_at_gmt']) ? strtotime($payment_data['created_at_gmt']) : time();
-                $amount_raw = $payment_data['amount'] ?? 0;
-                $currency = strtolower($payment_data['currency'] ?? 'jpy');
-                $formatted_amount = '';
-                if ($currency === 'jpy') {
-                    $formatted_amount = number_format($amount_raw) . '円';
-                } elseif ($currency === 'usd') {
-                    $formatted_amount = '$' . number_format($amount_raw / 100, 2);
-                } else {
-                    $formatted_amount = number_format($amount_raw) . ' ' . strtoupper($currency);
-                }
-                $metadata = maybe_unserialize($payment_data['metadata'] ?? '');
-                $plan_id_from_meta = $metadata['plan_id'] ?? 'N/A'; // Get plan_id from metadata
-
-                $replacements = [
-                    '{item_name}'         => $payment_data['item_name'] ?? '',
-                    '{amount}'            => $formatted_amount,
-                    '{customer_email}'    => $customer_email,
-                    '{payment_intent_id}' => $payment_data['payment_intent_id'] ?? 'N/A',
-                    '{customer_id}'       => $payment_data['customer_id'] ?? 'N/A',
-                    '{transaction_date}'  => wp_date(get_option('date_format') . ' ' . get_option('time_format'), $transaction_timestamp),
-                    '{user_name}'         => $user_display_name,
-                    '{user_id}'           => $user_id_display,
-                    '{site_name}'         => wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES),
-                    '{site_url}'          => home_url(),
-                    '{subscription_id}'   => $payment_data['subscription_id'] ?? 'N/A',
-                    '{plan_id}'           => $plan_id_from_meta, // Use value from metadata
-                ];
-
-                // --- Step 4: Prepare Headers (using filters - 変更なし) ---
-                $use_custom_from = !empty($mail_from_email) && is_email($mail_from_email);
-                $final_from_name = $use_custom_from ? $mail_from_name : $default_from_name;
-                $final_from_email = $use_custom_from ? $mail_from_email : $default_from_email;
-                $set_from_name = function ($original) use ($final_from_name) {
-                    return $final_from_name;
-                };
-                $set_from_email = function ($original) use ($final_from_email) {
-                    return $final_from_email;
-                };
-                $set_content_type = function () {
-                    return 'text/plain';
-                };
-                add_filter('wp_mail_from_name', $set_from_name);
-                add_filter('wp_mail_from', $set_from_email);
-                add_filter('wp_mail_content_type', $set_content_type);
-
-                // --- Step 5: Send Admin Notification ---
-                if (!empty($admin_notify_email)) {
-                    // ★ 読み込んだテンプレート変数を使う
-                    if (!is_string($admin_subject_template)) $admin_subject_template = $is_subscription ? $default_sub_admin_subject : $default_admin_subject;
-                    if (!is_string($admin_body_template)) $admin_body_template = $is_subscription ? $default_sub_admin_body : $default_admin_body;
-
-                    $admin_subject = str_replace(array_keys($replacements), array_values($replacements), $admin_subject_template);
-                    $admin_message_raw = str_replace(array_keys($replacements), array_values($replacements), $admin_body_template);
-                    $admin_message = str_replace(["\r\n", "\r"], "\n", $admin_message_raw);
-                    $admin_message = str_replace("\n", "\r\n", $admin_message);
-
-                    if (!wp_mail($admin_notify_email, $admin_subject, $admin_message)) { /* Log error */
-                        error_log(EDEL_STRIPE_PAYMENT_PREFIX . ' Admin email failed');
-                    } else { /* Log success */
-                        error_log("Edel Stripe: Admin notification sent to " . $admin_notify_email);
-                    }
-                }
-
-                // --- Step 6: Send Customer Notification (If enabled) ---
-                if ($send_customer_email === '1' && !empty($customer_email)) {
-                    // ★ 読み込んだテンプレート変数を使う
-                    if (!is_string($customer_subject_template)) $customer_subject_template = $is_subscription ? $default_sub_customer_subject : $default_customer_subject;
-                    if (!is_string($customer_body_template)) $customer_body_template = $is_subscription ? $default_sub_customer_body : $default_customer_body;
-
-                    $customer_subject = str_replace(array_keys($replacements), array_values($replacements), $customer_subject_template);
-                    $customer_message_raw = str_replace(array_keys($replacements), array_values($replacements), $customer_body_template);
-
-                    if ($is_new_user) { /* ... Add new user text ... */
-                    }
-                    $customer_message = str_replace(["\r\n", "\r"], "\n", $customer_message_raw);
-                    $customer_message = str_replace("\n", "\r\n", $customer_message);
-
-                    if (!wp_mail($customer_email, $customer_subject, $customer_message)) { /* Log error */
-                        error_log(EDEL_STRIPE_PAYMENT_PREFIX . ' Customer email failed: ' . $customer_email);
-                    } else { /* Log success */
-                        error_log("Edel Stripe: Customer notification sent to " . $customer_email);
-                    }
-                }
-
-                // --- Step 7: Clean up filters (変更なし) ---
-                remove_filter('wp_mail_from_name', $set_from_name);
-                remove_filter('wp_mail_from', $set_from_email);
-                remove_filter('wp_mail_content_type', $set_content_type);
-            } // end send_payment_notifications()
+            /**
+             * Helper function to get WP user by Stripe Customer ID stored in user meta.
+             */
+            private function get_user_by_stripe_customer_id($customer_id) {
+                if (empty($customer_id)) return false;
+                $user_query = new WP_User_Query(['meta_key' => EDEL_STRIPE_PAYMENT_PREFIX . 'customer_id', 'meta_value' => $customer_id, 'number' => 1, 'fields' => 'ID']);
+                $users = $user_query->get_results();
+                return !empty($users) ? get_userdata($users[0]) : false;
+            } // end get_user_by_stripe_customer_id
         } // End class EdelStripePaymentFront

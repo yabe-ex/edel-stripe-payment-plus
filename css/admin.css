@@ -22,3 +22,11 @@
     line-height: 1.5;
     height: auto;
 }
+
+.key {
+    display: flex;
+}
+
+.key label {
+    width: 200px;
+}

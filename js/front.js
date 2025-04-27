@@ -453,4 +453,84 @@ jQuery(document).ready(function ($) {
                 }); // End initial AJAX call
         }); // End formSub.on('submit')
     } // End initializeSubscriptionFormHandler
+
+    // Use event delegation in case shortcode is loaded dynamically
+    // Target the form directly by its ID
+    $(document).on('submit', '#edel-stripe-user-cancel-form', function (e) {
+        e.preventDefault(); // Prevent default form submission
+
+        var $form = $(this);
+        var $button = $form.find('.edel-stripe-user-cancel-button');
+        var $spinner = $form.find('.spinner'); // Get spinner added by PHP
+        // Find result area relative to the form, assuming it's a sibling
+        var $resultArea = $form.siblings('.cancel-result');
+
+        // Get data from hidden fields
+        var subId = $form.find('input[name="subscription_id"]').val();
+        var nonce = $form.find('input[name="security"]').val();
+        var action = $form.find('input[name="action"]').val(); // Should be 'edel_stripe_user_cancel_subscription'
+
+        if (!subId || !nonce || !action) {
+            alert('キャンセル処理に必要な情報が不足しています。');
+            return;
+        }
+
+        // Confirmation dialog
+        if (!confirm('本当にこのサブスクリプションをキャンセルしますか？\n（通常、現在の請求期間の終了時にキャンセルされます）')) {
+            return; // Stop if user cancels
+        }
+
+        // Disable button and show spinner
+        $button.prop('disabled', true).text('キャンセル処理中...');
+        // Ensure spinner element exists and show it
+        if ($spinner.length === 0) {
+            // Add spinner if it wasn't included in PHP (fallback)
+            $spinner = $('<span class="spinner is-active" style="vertical-align: middle; margin-left: 5px;"></span>');
+            $button.after($spinner);
+        }
+        $spinner.addClass('is-active').show(); // Ensure it's visible
+        if ($resultArea.length > 0) $resultArea.removeClass('success error').text('');
+
+        $.post(edelStripeParams.ajax_url, {
+            action: action, // アクション名
+            security: nonce, // Nonce値
+            subscription_id: subId // サブスクID
+        })
+            .done(function (response) {
+                // AJAX成功
+                if (response.success) {
+                    // PHP側で成功応答
+                    if ($resultArea.length > 0) {
+                        $resultArea.addClass('success').text(response.data.message || 'キャンセル要求を受け付けました。');
+                    } else {
+                        alert(response.data.message || 'キャンセル要求を受け付けました。');
+                    }
+                    // ボタンとスピナーを削除
+                    $button.remove();
+                    $spinner.remove();
+                } else {
+                    // PHP側でエラー応答
+                    if ($resultArea.length > 0) {
+                        $resultArea.addClass('error').text(response.data.message || 'キャンセル処理中にエラーが発生しました。');
+                    } else {
+                        alert('キャンセルエラー: ' + (response.data.message || '不明なエラー'));
+                    }
+                    $button.prop('disabled', false).text('サブスクリプションをキャンセル'); // ボタンを元に戻す
+                }
+            })
+            .fail(function () {
+                // AJAX通信失敗
+                if ($resultArea.length > 0) {
+                    $resultArea.addClass('error').text('サーバーとの通信に失敗しました。');
+                } else {
+                    alert('サーバーとの通信に失敗しました。');
+                }
+                $button.prop('disabled', false).text('サブスクリプションをキャンセル');
+            })
+            .always(function () {
+                // スピナー削除 (念のため)
+                $spinner.remove();
+                // ボタンの状態は done/fail で制御済み
+            });
+    }); // End user cancel form submit handler
 }); // End document ready

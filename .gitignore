@@ -1,0 +1,11 @@
+# macOS specific files
+.DS_Store
+._*
+
+# IDE/Editor specific files (adjust as needed)
+.idea/
+.vscode/
+
+# Log files (like WP Debug log if generated inside)
+*.log
+debug.log

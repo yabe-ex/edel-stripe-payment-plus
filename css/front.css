@@ -192,3 +192,92 @@
     background-color: #cff4fc;
     border-color: #b6effb;
 }
+
+/* --- マイアカウントページ共通 --- */
+.edel-stripe-my-account-wrap {
+    border: 1px solid #e0e0e0;
+    padding: 20px 30px;
+    background: #fff;
+    margin-bottom: 20px;
+}
+.edel-stripe-my-account-wrap h2 {
+    margin-top: 0;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #eee;
+    margin-bottom: 20px;
+    font-size: 1.4em;
+}
+.edel-stripe-my-account-wrap hr {
+    margin: 30px 0;
+    border: 0;
+    border-top: 1px solid #eee;
+}
+
+/* --- 契約情報テーブル --- */
+.edel-stripe-my-account-details {
+    width: 100%;
+    margin-bottom: 20px;
+}
+.edel-stripe-my-account-details th {
+    width: 30%; /* Adjust width */
+    text-align: left;
+    padding: 10px 10px 10px 0;
+    vertical-align: top;
+    font-weight: bold;
+}
+.edel-stripe-my-account-details td {
+    padding: 10px 0;
+    vertical-align: top;
+}
+.edel-stripe-my-account-details small {
+    display: block;
+    color: #666;
+    font-size: 0.9em;
+    margin-top: 4px;
+}
+.edel-stripe-my-account-details .button {
+    /* Cancel button */
+    margin-top: 5px;
+}
+.edel-stripe-my-account-details .cancel-result {
+    margin-top: 10px;
+    font-size: 0.95em;
+}
+
+/* --- ★決済履歴テーブルのスタイル --- */
+.edel-stripe-history-table {
+    width: 100%;
+    border-collapse: collapse; /* 境界線を重ねる */
+    margin-top: 15px;
+    font-size: 0.95em; /* テーブル内の文字サイズを少し小さく */
+}
+
+.edel-stripe-history-table th,
+.edel-stripe-history-table td {
+    padding: 10px 12px; /* セルの内側余白 */
+    text-align: left;
+    border: 1px solid #e0e0e0; /* セルに境界線 */
+    vertical-align: middle; /* 文字を垂直中央揃え */
+}
+
+.edel-stripe-history-table thead th {
+    background-color: #f1f1f1; /* ヘッダー行の背景色 */
+    font-weight: bold;
+}
+
+.edel-stripe-history-table tbody tr:nth-child(odd) {
+    background-color: #f9f9f9; /* 奇数行の背景色（ストライプ） */
+}
+
+.edel-stripe-history-table .history-amount {
+    text-align: right; /* 金額は右揃え */
+    white-space: nowrap; /* 金額が折り返さないように */
+}
+
+.edel-stripe-history-table .history-id code {
+    font-size: 0.9em; /* IDは少し小さく */
+    word-break: break-all; /* 長いIDで折り返す */
+}
+.edel-stripe-history-table .history-status {
+    font-weight: bold; /* ステータスを太字に */
+}
