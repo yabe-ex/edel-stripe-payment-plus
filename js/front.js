@@ -236,7 +236,7 @@ jQuery(document).ready(function ($) {
 
         var submitButton = $('#edel-stripe-submit-button-sub'); // Use static ID
         var resultMessage = $('#edel-stripe-subscription-result'); // Use static ID
-        var spinner = formSub.find('.spinner-sub'); // Use specific class
+        var spinner = formSub.find('.edel-stripe-spinner'); // Use specific class
         var errorDiv = $('#card-errors-sub'); // Use static ID
         var consentCheckbox = $('#privacy-policy-agree-sub'); // Use static ID
         var consentErrorDiv = $('#consent-error-sub'); // Use static ID
@@ -485,7 +485,7 @@ jQuery(document).ready(function ($) {
         // Ensure spinner element exists and show it
         if ($spinner.length === 0) {
             // Add spinner if it wasn't included in PHP (fallback)
-            $spinner = $('<span class="spinner is-active" style="vertical-align: middle; margin-left: 5px;"></span>');
+            $spinner = $('<span class="edel-stripe-spinner is-active" style="vertical-align: middle; margin-left: 5px;"></span>');
             $button.after($spinner);
         }
         $spinner.addClass('is-active').show(); // Ensure it's visible
@@ -529,7 +529,9 @@ jQuery(document).ready(function ($) {
             })
             .always(function () {
                 // スピナー削除 (念のため)
-                $spinner.remove();
+                // $spinner.remove();
+                $button.siblings('.edel-stripe-spinner').remove();
+                $actionsCell.find('.edel-stripe-spinner').remove();
                 // ボタンの状態は done/fail で制御済み
             });
     }); // End user cancel form submit handler

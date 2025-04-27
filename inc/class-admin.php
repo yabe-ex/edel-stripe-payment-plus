@@ -446,6 +446,8 @@ class EdelStripePaymentAdmin {
             $options['sub_cancel_customer_subject'] = isset($_POST['sub_cancel_customer_subject']) ? sanitize_text_field($_POST['sub_cancel_customer_subject']) : '';
             $options['sub_cancel_customer_body'] = isset($_POST['sub_cancel_customer_body']) ? wp_kses_post($_POST['sub_cancel_customer_body']) : '';
 
+            // アンインストール時の設定
+            $options['delete_data_on_uninstall'] = isset($_POST['delete_data_on_uninstall']) ? '1' : '0';
 
             // --- APIキー有効性チェック ---
             $test_key_valid = null;
@@ -558,6 +560,7 @@ class EdelStripePaymentAdmin {
         $sub_cancel_send_customer = $options['sub_cancel_send_customer'] ?? '1';
         $sub_cancel_customer_subject = $options['sub_cancel_customer_subject'] ?? $default_sub_cancel_customer_subject;
         $sub_cancel_customer_body = $options['sub_cancel_customer_body'] ?? $default_sub_cancel_customer_body;
+        $delete_data_on_uninstall = $options['delete_data_on_uninstall'] ?? '0'; // デフォルトは OFF ('0')
 
 
         // Placeholders list
@@ -976,7 +979,24 @@ class EdelStripePaymentAdmin {
                                 <p class="description">利用可能なプレースホルダー: <?php echo $placeholders; ?></p>
                             </td>
                         </tr>
-
+                    </table>
+                    <hr>
+                    <h2>アンインストール設定</h2>
+                    <table class="form-table">
+                        <tr>
+                            <th><label for="delete_data_on_uninstall">データ削除</label></th>
+                            <td>
+                                <label>
+                                    <input type="checkbox" id="delete_data_on_uninstall" name="delete_data_on_uninstall" value="1" <?php checked($delete_data_on_uninstall, '1'); ?>>
+                                    <span style="color: red; font-weight: bold;">プラグイン削除時に、データベーステーブルと設定情報を完全に削除する</span>
+                                </label>
+                                <p class="description">
+                                    <span style="color: red;">注意: このオプションを有効にすると、プラグインを「削除」した際に、全ての決済履歴・サブスク履歴（カスタムテーブル）とプラグイン設定が完全に失われ、元に戻すことはできません。</span><br>
+                                    プラグインを一時的に「停止」するだけではデータは削除されません。通常はこのオプションを有効にする必要はありません。<br>
+                                    <span style="color: red;">※ユーザーメタ情報（Stripe顧客ID、サブスクID/ステータス）は、このオプションを有効にしても削除されません。</span>
+                                </p>
+                            </td>
+                        </tr>
                     </table>
                 </div>
                 <p class="submit">

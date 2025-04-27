@@ -1489,31 +1489,34 @@ class EdelStripePaymentFront {
             <?php
                 // Display amount with correct symbol/format
                 $currency_symbol = '';
+                $currency_symbol = '';
                 $amount_display = '';
+                $symbol_position = 'before'; // Default for $ etc.
+
                 if ($currency === 'jpy') {
                     $currency_symbol = '円';
                     $amount_display = number_format($amount);
+                    $symbol_position = 'after'; // ★ JPY symbol comes after
                 } elseif ($currency === 'usd') {
-                    // Stripe expects USD amount in cents, shortcode expects base unit ($12 = 1200).
-                    // We need to be clear about the 'amount' attribute unit. Let's assume 'amount' is base unit.
-                    // For display, divide cents by 100. Stripe amount passed to API should be in cents.
-                    // Let's assume amount passed to shortcode is 1200 for $12.00.
                     $currency_symbol = '$';
-                    $amount_display = number_format($amount / 100, 2); // Display as $12.00
-                    // NOTE: The Payment Intent needs to receive amount in cents (1200).
-                    // The PHP 'process_onetime_payment' needs adjustment if 'amount' is not always in smallest unit.
-                    // Let's assume for now the PHP will handle the amount conversion based on currency.
-                    // Rechecking process_onetime_payment - it currently takes amount directly.
-                    // Simplest is to require amount="1200" for $12.00 USD in the shortcode.
-                    $amount_display = number_format($amount / 100, 2); // Display requires division
+                    // Assume amount attribute is always in smallest unit (cents)
+                    $amount_display = number_format($amount / 100, 2);
+                    $symbol_position = 'before';
                 } else {
                     // Fallback for other currencies
                     $currency_symbol = strtoupper($currency);
-                    $amount_display = number_format($amount); // Assuming base unit integer
+                    $amount_display = number_format($amount);
+                    $symbol_position = 'after'; // Assume symbol after for other unspecified currencies
                 }
             ?>
             <?php if ($amount > 0): ?>
-                <p>金額: <?php echo $currency_symbol; ?><?php echo $amount_display; ?></p>
+                <p>金額: <?php
+                        if ($symbol_position === 'before') {
+                            echo esc_html($currency_symbol) . esc_html($amount_display);
+                        } else {
+                            echo esc_html($amount_display) . esc_html($currency_symbol);
+                        }
+                        ?></p>
             <?php endif; ?>
 
             <form id="edel-stripe-payment-form">
@@ -1565,7 +1568,7 @@ class EdelStripePaymentFront {
                 <?php endif; ?>
 
                 <button type="submit" id="edel-stripe-submit-button" class="edel-stripe-submit-button"><?php echo esc_html($button_text); ?></button>
-                <div class="spinner edel-stripe-spinner" style="display: none;"></div>
+                <div class="edel-stripe-spinner" style="display: none;"></div>
             </form>
 
             <div id="edel-stripe-payment-result" class="edel-stripe-result-message" style="margin-top: 15px;"></div>

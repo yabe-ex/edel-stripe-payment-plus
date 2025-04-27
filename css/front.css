@@ -86,7 +86,6 @@
 
 /* --- ★送信ボタン (クラスセレクタに変更) --- */
 .edel-stripe-payment-form-wrap .edel-stripe-submit-button {
-    /* ← IDからクラスへ */
     display: block;
     width: 100%;
     padding: 14px;
@@ -110,9 +109,7 @@
 }
 
 /* --- ★スピナー (クラスセレクタに変更) --- */
-/* .spinner または .spinner-sub クラスに適用される */
 .edel-stripe-payment-form-wrap .edel-stripe-spinner {
-    /* ← 共通クラスへ */
     display: inline-block;
     border: 3px solid #f3f3f3;
     border-top: 3px solid #007cba;
@@ -124,12 +121,15 @@
     vertical-align: middle;
 }
 @keyframes edel-stripe-spin {
-    /* (変更なし) */
+    0% {
+        transform: rotate(0deg);
+    }
+    100% {
+        transform: rotate(360deg);
+    }
 }
 
 /* --- ★同意チェックボックス関連 (クラスに変更) --- */
-/* 標準チェックボックス表示に戻したため、カスタムスタイルは削除済みのはず */
-/* 必要なら .privacy-consent, .edel-stripe-consent-label, .edel-stripe-consent-input, .edel-stripe-consent-error にスタイルを適用 */
 .edel-stripe-payment-form-wrap .privacy-consent {
     margin-top: 20px;
     margin-bottom: 20px; /* 他のform-rowに合わせる */
@@ -137,20 +137,15 @@
     line-height: 1.6;
 }
 .edel-stripe-payment-form-wrap .edel-stripe-consent-label {
-    /* label */
-    /* display: flex などは不要（標準チェックボックスのため） */
     cursor: pointer;
 }
 .edel-stripe-payment-form-wrap .edel-stripe-consent-input {
-    /* input[type=checkbox] */
     margin-right: 8px; /* テキストとの間にスペース */
     vertical-align: middle; /* テキストと垂直位置を合わせる */
     width: 16px; /* 標準チェックボックスのサイズ調整（ブラウザ依存） */
     height: 16px;
 }
 .edel-stripe-payment-form-wrap .edel-stripe-consent-error {
-    /* div */
-    /* margin-left: 24px; */ /* インデントは不要かも */
     margin-top: 5px;
     font-size: 0.9em;
     color: red;
