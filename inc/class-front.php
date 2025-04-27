@@ -43,6 +43,9 @@ class EdelStripePaymentFront {
      * @return string HTML output for the my account page.
      */
     public function render_my_account_page($atts) {
+        $log_prefix = '[Edel Stripe MyAccount] '; // ★ 追加：ログ接頭辞を定義
+        error_log($log_prefix . 'Shortcode rendering started.');
+
         // Check if user is logged in
         if (!is_user_logged_in()) {
             return '<p>このコンテンツを表示するには<a href="' . esc_url(wp_login_url(get_permalink())) . '">ログイン</a>してください。</p>';
@@ -57,9 +60,9 @@ class EdelStripePaymentFront {
 
         // Get saved data from user meta
         $subscription_id = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_id', true);
-        $customer_id = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'customer_id', true);
-        // Get status from meta as a fallback or initial value
         $subscription_status_meta = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', true);
+        $customer_id = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'customer_id', true);
+        error_log($log_prefix . "UserID: {$user_id}, SubID from Meta: {$subscription_id}, Status from Meta: {$subscription_status_meta}");
 
         // Variables to store fetched Stripe data
         $stripe_subscription = null;
@@ -76,14 +79,17 @@ class EdelStripePaymentFront {
             $secret_key = $is_live_mode ? ($options['live_secret_key'] ?? '') : ($options['test_secret_key'] ?? '');
 
             if (!empty($secret_key)) {
+                error_log($log_prefix . "Attempting to retrieve Stripe subscription: {$subscription_id}");
                 try {
                     $stripe = new \Stripe\StripeClient($secret_key);
                     \Stripe\Stripe::setApiVersion("2024-04-10");
 
                     // Retrieve subscription and expand plan and product info
                     $stripe_subscription = $stripe->subscriptions->retrieve($subscription_id, ['expand' => ['plan.product']]);
+                    error_log($log_prefix . "Stripe API Retrieve successful. Status: " . ($stripe_subscription->status ?? 'N/A')); // ★ Log Stripe status
 
                     if ($stripe_subscription) {
+                        error_log($log_prefix . "Stripe API Retrieve successful. Status from Stripe: " . ($stripe_subscription->status ?? 'N/A')); // ★ Stripeからのステータスをログ出力
                         $current_status_from_stripe = $stripe_subscription->status; // Get the most current status
 
                         // Format plan details for display
@@ -106,22 +112,25 @@ class EdelStripePaymentFront {
 
                             $interval_str = '';
                             if ($plan_interval_count == 1) {
-                                if ($interval == 'month') $interval_str = '月';
-                                elseif ($interval == 'year') $interval_str = '年';
-                                elseif ($interval == 'week') $interval_str = '週';
-                                elseif ($interval == 'day') $interval_str = '日';
-                                else $interval_str = $interval;
+                                if ($plan_interval == 'month') $interval_str = '月';
+                                elseif ($plan_interval == 'year') $interval_str = '年';
+                                elseif ($plan_interval == 'week') $interval_str = '週';
+                                elseif ($plan_interval == 'day') $interval_str = '日';
+                                else $interval_str = $plan_interval; // 不明な間隔はそのまま表示
                             } else {
                                 $interval_str = $plan_interval_count . ' ';
-                                if ($interval == 'month') $interval_str .= 'ヶ月';
-                                elseif ($interval == 'year') $interval_str .= '年';
-                                else $interval_str .= $interval;
+                                if ($plan_interval == 'month') $interval_str .= 'ヶ月';
+                                elseif ($plan_interval == 'year') $interval_str .= '年';
+                                elseif ($plan_interval == 'week') $interval_str .= '週間'; // 複数週対応
+                                elseif ($plan_interval == 'day') $interval_str .= '日間'; // 複数日対応
+                                else $interval_str .= $plan_interval; // 不明な間隔
                             }
 
                             $plan_details_str = esc_html($product_name) . ' (' . $amount_str . ' / ' . esc_html($interval_str) . ')';
                         } else {
                             $plan_details_str = 'プラン情報取得失敗';
                         }
+                        error_log($log_prefix . "Plan Details String: " . $plan_details_str); // ★ ログ出力
 
                         // Format next billing date
                         if ($stripe_subscription->current_period_end) {
@@ -133,11 +142,13 @@ class EdelStripePaymentFront {
                         } else {
                             $next_billing_str = '---';
                         }
+                        error_log($log_prefix . "Next Billing String: " . $next_billing_str); // ★ ログ出力
 
                         // Check if cancellation is scheduled
                         if ($stripe_subscription->cancel_at_period_end) {
                             $cancel_at_str = ' (期間終了時 ' . wp_date(get_option('date_format'), $stripe_subscription->current_period_end) . ' にキャンセル予定)';
                         }
+                        error_log($log_prefix . "Cancel at Period End: " . ($stripe_subscription->cancel_at_period_end ? 'Yes' : 'No')); // ★ ログ出力
 
                         // Update user meta status if different from Stripe (optional sync here)
                         if ($current_status_from_stripe !== $subscription_status_meta) {
@@ -164,7 +175,12 @@ class EdelStripePaymentFront {
                 $plan_details_str = '取得不可';
                 $next_billing_str = '取得不可';
             }
-        } // end if $subscription_id
+        } else {
+            error_log($log_prefix . 'No subscription ID found in user meta.');
+        }
+
+        error_log($log_prefix . 'Final Status for Display: ' . $current_status_from_stripe); // ★ Log final status variable
+
 
         // --- Fetch Payment History ---
         global $wpdb;
@@ -311,6 +327,8 @@ class EdelStripePaymentFront {
             </div>
 
         </div><?php
+                error_log($log_prefix . 'Finished rendering shortcode.'); // ★ 関数終了ログ
+
                 return ob_get_clean();
             } // end render_my_account_page
 
@@ -562,7 +580,7 @@ class EdelStripePaymentFront {
                                 error_log($error_log_prefix . 'Data before sending cancel notification: ' . print_r($notification_data, true));
 
                                 // Send cancellation notification email
-                                $this->send_webhook_or_signup_notification('subscription_canceled', $notification_data);
+                                $this->send_webhook_or_signup_notification('subscription_canceled', $notification_data, false, $user_email);
                                 $processed = true;
                             }
                             break;
@@ -591,7 +609,7 @@ class EdelStripePaymentFront {
                                     }
 
                                     // Send payment failed notification email
-                                    $this->send_webhook_or_signup_notification('payment_failed', $notification_data);
+                                    $this->send_webhook_or_signup_notification('payment_failed', $notification_data, false, $user_email);
                                     $processed = true;
                                 }
                             } else {
@@ -1632,8 +1650,12 @@ class EdelStripePaymentFront {
             private function send_payment_notifications($payment_data, $customer_email, $is_new_user) {
                 $is_subscription = !empty($payment_data['subscription_id']);
                 $context = $is_subscription ? 'signup_subscription' : 'signup_onetime';
-                // Pass data to the unified handler
-                $this->send_webhook_or_signup_notification($context, $payment_data, $is_new_user);
+                $error_log_prefix = '[Edel Stripe Record] '; // Use context from calling function
+
+                error_log($error_log_prefix . 'Passing data to unified notification handler. Context: ' . $context . ' Email: ' . $customer_email);
+
+                // ★★★ 修正: 4番目の引数に $customer_email を追加 ★★★
+                $this->send_webhook_or_signup_notification($context, $payment_data, $is_new_user, $customer_email);
             } // end send_payment_notifications
 
             /**
