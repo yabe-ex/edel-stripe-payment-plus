@@ -276,3 +276,39 @@
 .edel-stripe-history-table .history-status {
     font-weight: bold; /* ステータスを太字に */
 }
+
+.edel-stripe-logout-link {
+    display: inline-block; /* ボタンのように振る舞わせる */
+    padding: 8px 16px; /* 内側の余白 */
+    font-size: 0.9em; /* 文字サイズ */
+    line-height: 1.5; /* 行の高さ */
+    text-align: center;
+    text-decoration: none; /* 下線を消す */
+    color: #333; /* 文字色 */
+    background-color: #f0f0f0; /* 背景色 (薄いグレー) */
+    border: 1px solid #ccc; /* 枠線 */
+    border-radius: 3px; /* 角丸 */
+    cursor: pointer; /* カーソルをポインターに */
+    transition: background-color 0.15s ease-in-out, border-color 0.15s ease-in-out;
+    white-space: nowrap; /* 折り返さない */
+}
+
+.edel-stripe-logout-link:hover,
+.edel-stripe-logout-link:focus {
+    background-color: #e0e0e0; /* ホバー時背景色 */
+    border-color: #bbb;
+    color: #111;
+    outline: none;
+}
+
+.edel-stripe-logout-link:active {
+    background-color: #ccc; /* クリック時背景色 */
+    border-color: #aaa;
+}
+
+.edel-stripe-login-wrap .login-lost-password {
+    text-align: right; /* 右寄せにする */
+    font-size: 0.9em; /* 少し文字を小さく */
+    margin-top: -10px; /* 上の要素（Remember Me）との間隔を詰める（値は調整可） */
+    margin-bottom: 15px; /* 下のボタンとの間隔を少し空ける */
+}

@@ -64,7 +64,6 @@ function edel_stripe_payment_php_version_notice() {
 // --- 必要なクラスファイルを読み込む ---
 require_once EDEL_STRIPE_PAYMENT_PATH . '/inc/class-admin.php';
 require_once EDEL_STRIPE_PAYMENT_PATH . '/inc/class-front.php';
-// ※List Tableクラスも admin.php かここで読み込む必要あり
 require_once EDEL_STRIPE_PAYMENT_PATH . '/inc/class-payment-history-list-table.php';
 
 
@@ -104,7 +103,7 @@ function edel_stripe_initialize_updater() {
         error_log('Error initializing Plugin Update Checker for Edel Stripe Payment: ' . $e->getMessage());
     }
 }
-// plugins_loaded フックで初期化関数を呼び出す
+
 add_action('plugins_loaded', 'edel_stripe_initialize_updater');
 
 
@@ -128,6 +127,7 @@ class EdelStripePayment {
         add_action('admin_menu', array($this->admin_instance, 'admin_menu'));
         add_filter('plugin_action_links_' . EDEL_STRIPE_PAYMENT_BASENAME, array($this->admin_instance, 'plugin_action_links'));
         add_action('admin_enqueue_scripts', array($this->admin_instance, 'admin_enqueue'));
+        add_filter('login_redirect', array($this->front_instance, 'filter_login_redirect'), 10, 3);
 
         $cancel_sub_action = 'edel_stripe_cancel_subscription';
         add_action('wp_ajax_' . $cancel_sub_action, array($this->admin_instance, 'ajax_cancel_subscription'));
@@ -143,6 +143,7 @@ class EdelStripePayment {
         add_shortcode('stripe_onetime', array($this->front_instance, 'render_onetime_shortcode'));
         add_shortcode('edel_stripe_subscription', array($this->front_instance, 'render_subscription_shortcode'));
         add_shortcode('edel_stripe_my_account', array($this->front_instance, 'render_my_account_page'));
+        add_shortcode('edel_stripe_login', array($this->front_instance, 'render_login_form'));
 
         // AJAXハンドラー登録
         $ajax_action_name = 'edel_stripe_process_onetime';
@@ -153,12 +154,16 @@ class EdelStripePayment {
         add_action('wp_ajax_nopriv_' . $record_action_name, array($this->front_instance, 'record_successful_payment'));
 
         // ★サブスク： サブスク作成用★
-        $sub_action_name = 'edel_stripe_process_subscription'; // JSから送られる action 名
+        $sub_action_name = 'edel_stripe_process_subscription';
         add_action('wp_ajax_' . $sub_action_name, array($this->front_instance, 'process_subscription'));
         add_action('wp_ajax_nopriv_' . $sub_action_name, array($this->front_instance, 'process_subscription'));
 
         $user_cancel_action = 'edel_stripe_user_cancel_subscription';
         add_action('wp_ajax_' . $user_cancel_action, array($this->front_instance, 'ajax_user_cancel_subscription')); // ログインユーザー専用
+
+        $login_action = 'edel_stripe_do_login';
+        add_action('wp_ajax_nopriv_' . $login_action, array($this->front_instance, 'ajax_do_login'));
+        add_action('wp_ajax_' . $login_action, array($this->front_instance, 'ajax_do_login'));
 
         // REST API エンドポイント（Webhook用）の登録
         add_action('rest_api_init', array($this->front_instance, 'register_webhook_endpoint'));

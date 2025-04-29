@@ -73,6 +73,9 @@ jQuery(document).ready(function ($) {
         }
     }
 
+    // --- カスタムログインフォーム処理関数の呼び出し ---
+    initializeLoginFormHandler();
+
     // =============================================
     // === 買い切りフォーム処理関数 ==============
     // =============================================
@@ -264,6 +267,7 @@ jQuery(document).ready(function ($) {
             var userEmail = $('#edel-stripe-sub-email').val(); // Use static ID
             var securityNonce = formSub.find('input[name="subscription_security"]').val(); // ★ Use correct nonce name
             var planId = formSub.find('input[name="plan_id"]').val();
+            var trialDays = formSub.find('input[name="trial_days"]').val() || '0'; // Default to '0' if not found
             var customerId; // For storing customer ID from response
 
             // Step 1: バックエンドにサブスク作成依頼
@@ -271,7 +275,8 @@ jQuery(document).ready(function ($) {
                 action: 'edel_stripe_process_subscription',
                 subscription_security: securityNonce,
                 email: userEmail,
-                plan_id: planId
+                plan_id: planId,
+                trial_days: trialDays
             })
                 .done(function (response) {
                     // Step 2: バックエンド応答処理
@@ -535,4 +540,99 @@ jQuery(document).ready(function ($) {
                 // ボタンの状態は done/fail で制御済み
             });
     }); // End user cancel form submit handler
+
+    function initializeLoginFormHandler() {
+        var $form = $('#edel-stripe-login-form'); // Login form ID
+        if ($form.length === 0) return; // Exit if form doesn't exist
+
+        var $submitButton = $form.find('#edel-login-submit');
+        var $messages = $form.find('#edel-login-messages');
+        var $spinner = $form.find('.edel-stripe-spinner'); // Expecting unified spinner class
+        var $recaptchaInput = $form.find('#g-recaptcha-response-login');
+
+        $form.on('submit', function (e) {
+            e.preventDefault();
+            $submitButton.prop('disabled', true);
+            // Ensure spinner exists visually
+            if ($spinner.length === 0) {
+                $spinner = $('<span class="edel-stripe-spinner"></span>');
+                $submitButton.after($spinner);
+            }
+            $spinner.addClass('is-active').css('visibility', 'visible');
+            $messages.removeClass('success error info').text('').hide();
+
+            // Get reCAPTCHA settings from localized params
+            var useRecaptcha = edelStripeParams.login_recaptcha_enabled === '1';
+            var siteKey = edelStripeParams.login_recaptcha_site_key || '';
+
+            // --- reCAPTCHA v3 Execution (if enabled) ---
+            if (useRecaptcha && siteKey && typeof grecaptcha !== 'undefined' && grecaptcha.execute) {
+                grecaptcha.ready(function () {
+                    grecaptcha
+                        .execute(siteKey, { action: 'login' }) // 'login' action name
+                        .then(function (token) {
+                            $recaptchaInput.val(token); // Set token to hidden input
+                            performAjaxLogin(); // Proceed to AJAX login
+                        })
+                        .catch(function (error) {
+                            console.error('reCAPTCHA execution error:', error);
+                            $messages.addClass('error').text('reCAPTCHAの実行に失敗しました。').show();
+                            resetLoginFormState();
+                        });
+                });
+            } else {
+                if (useRecaptcha && siteKey) {
+                    console.warn('grecaptcha object not ready or execute function missing.');
+                    $messages.addClass('error').text('reCAPTCHAの準備ができていません。').show();
+                    resetLoginFormState();
+                    return; // Stop if reCAPTCHA is needed but not ready
+                }
+                performAjaxLogin(); // Perform login without reCAPTCHA if disabled
+            }
+        }); // End form submit handler
+
+        // --- Function to perform the actual AJAX login ---
+        function performAjaxLogin() {
+            var formData = $form.serialize(); // Collects all form fields (inc. hidden action, security, redirect_to, g-recaptcha-response)
+
+            $.post(edelStripeParams.ajax_url, formData)
+                .done(function (response) {
+                    if (response.success) {
+                        $messages
+                            .removeClass('error info')
+                            .addClass('success')
+                            .text(response.data.message || 'ログイン成功')
+                            .show();
+                        // Redirect to the specified URL after a short delay
+                        var redirectUrl = $form.find('input[name="redirect_to"]').val() || '/'; // Get redirect URL from hidden field
+                        window.location.href = response.data.redirect_url || redirectUrl; // Use URL from response if available
+                    } else {
+                        // Login failed (WP error or reCAPTCHA fail)
+                        $messages
+                            .removeClass('success info')
+                            .addClass('error')
+                            .text(response.data.message || 'ログインに失敗しました。')
+                            .show();
+                        resetLoginFormState(); // Reset form
+                    }
+                })
+                .fail(function (jqXHR, textStatus, errorThrown) {
+                    // AJAX communication failed
+                    console.error('Login AJAX failed:', textStatus, errorThrown);
+                    $messages.removeClass('success info').addClass('error').text('サーバーとの通信に失敗しました。').show();
+                    resetLoginFormState(); // Reset form
+                })
+                .always(function () {
+                    // Always logic is handled within resetLoginFormState or success redirect
+                });
+        } // End performAjaxLogin
+
+        // --- Function to reset form state after error ---
+        function resetLoginFormState() {
+            $submitButton.prop('disabled', false);
+            $form.find('.edel-stripe-spinner').remove(); // Remove spinner
+            $form.find('#edel-pwd').val(''); // Clear password field
+            $recaptchaInput.val(''); // Clear recaptcha token
+        } // End resetLoginFormState
+    } // End initializeLoginFormHandler
 }); // End document ready

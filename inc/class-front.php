@@ -14,186 +14,430 @@ class EdelStripePaymentFront {
     private $add_frontend_scripts = false;
 
     /**
-     * Registers the REST API endpoint for Stripe Webhooks.
+     * Handles AJAX login requests from the custom login form.
+     * Verifies reCAPTCHA (if enabled) and attempts WordPress login.
      */
-    public function register_webhook_endpoint() {
-        error_log('[Edel Stripe REST] Attempting to register webhook endpoint /edel-stripe/v1/webhook...'); // ★ Log Start
+    public function ajax_do_login() {
+        // Verify Nonce first
+        check_ajax_referer(EDEL_STRIPE_PAYMENT_PREFIX . 'login_nonce', 'security');
 
-        $registered = register_rest_route(
-            'edel-stripe/v1', // Namespace
-            '/webhook',       // Route
-            array(
-                'methods'             => 'POST', // Accept only POST requests
-                'callback'            => array($this, 'handle_webhook'), // Callback function
-                'permission_callback' => '__return_true', // Allow public access (Stripe needs to reach it) - Security is handled by signature verification
-            )
-        );
-        if ($registered) {
-            error_log('[Edel Stripe REST] Webhook endpoint registered successfully.');
+        // Get POST data
+        $username = isset($_POST['log']) ? trim($_POST['log']) : '';
+        $password = isset($_POST['pwd']) ? $_POST['pwd'] : ''; // Do not trim password
+        $remember = isset($_POST['rememberme']);
+        $recaptcha_token = isset($_POST['g-recaptcha-response']) ? $_POST['g-recaptcha-response'] : null;
+        $redirect_url = isset($_POST['redirect_to']) ? esc_url_raw($_POST['redirect_to']) : admin_url(); // Get redirect URL
+
+        // --- reCAPTCHA v3 Verification (if enabled) ---
+        $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+        $enable_recaptcha = $options['login_enable_recaptcha'] ?? '0';
+        $recaptcha_secret_key = $options['login_recaptcha_secret_key'] ?? '';
+        $recaptcha_threshold = floatval($options['login_recaptcha_threshold'] ?? 0.5);
+
+        if ($enable_recaptcha === '1') {
+            if (empty($recaptcha_secret_key)) {
+                wp_send_json_error(['message' => 'サーバーエラー: reCAPTCHAシークレットキーが設定されていません。']);
+                return;
+            }
+            if (empty($recaptcha_token)) {
+                wp_send_json_error(['message' => 'reCAPTCHAトークンがありません。ブラウザでJavaScriptが有効になっているか確認してください。']);
+                return;
+            }
+
+            // Call Google verification API
+            $verify_url = 'https://www.google.com/recaptcha/api/siteverify';
+            $verify_args = [
+                'body' => [
+                    'secret'   => $recaptcha_secret_key,
+                    'response' => $recaptcha_token,
+                    'remoteip' => $_SERVER['REMOTE_ADDR'] ?? null,
+                ]
+            ];
+            $response = wp_remote_post($verify_url, $verify_args);
+
+            if (is_wp_error($response)) {
+                error_log('[Edel Stripe Login] reCAPTCHA verification request failed: ' . $response->get_error_message());
+                wp_send_json_error(['message' => 'reCAPTCHAサーバーとの通信に失敗しました。']);
+                return;
+            }
+
+            $response_body = wp_remote_retrieve_body($response);
+            $result = json_decode($response_body, true);
+
+            if (!$result || !isset($result['success'])) {
+                error_log('[Edel Stripe Login] reCAPTCHA verification failed - Invalid response: ' . $response_body);
+                wp_send_json_error(['message' => 'reCAPTCHAの検証に失敗しました (不正な応答)。']);
+                return;
+            }
+
+            if ($result['success'] !== true) {
+                error_log('[Edel Stripe Login] reCAPTCHA verification failed - Success false. Errors: ' . print_r($result['error-codes'] ?? 'N/A', true));
+                wp_send_json_error(['message' => 'reCAPTCHAの検証に失敗しました。']);
+                return;
+            }
+
+            if (!isset($result['score'])) {
+                error_log('[Edel Stripe Login] reCAPTCHA verification failed - Score missing.');
+                wp_send_json_error(['message' => 'reCAPTCHAの検証に失敗しました (スコアなし)。']);
+                return;
+            }
+
+            if ($result['score'] < $recaptcha_threshold) {
+                error_log('[Edel Stripe Login] reCAPTCHA verification failed - Score too low: ' . $result['score'] . ' Threshold: ' . $recaptcha_threshold);
+                wp_send_json_error(['message' => 'reCAPTCHAの検証に失敗しました (スコア不足)。ボットでないことを確認してください。']);
+                return;
+            }
+
+            error_log('[Edel Stripe Login] reCAPTCHA verification successful. Score: ' . $result['score']);
+            // reCAPTCHA passed or was disabled, proceed to login
         } else {
-            error_log('[Edel Stripe REST] FAILED to register webhook endpoint!');
+            error_log('[Edel Stripe Login] reCAPTCHA verification skipped (disabled in settings).');
         }
-    }
+
+        // --- Attempt WordPress Login ---
+        if (empty($username) || empty($password)) {
+            wp_send_json_error(['message' => 'ユーザー名とパスワードを入力してください。']);
+            return;
+        }
+
+        $creds = array(
+            'user_login'    => $username,
+            'user_password' => $password,
+            'remember'      => $remember
+        );
+
+        // Determine if we need secure cookie
+        $secure_cookie = is_ssl();
+
+        error_log('[Edel Stripe Login] Attempting wp_signon for user: ' . $username);
+        $user = wp_signon($creds, $secure_cookie);
+
+        // Check login result
+        if (is_wp_error($user)) {
+            error_log('[Edel Stripe Login] wp_signon failed: ' . $user->get_error_message());
+            // Provide generic message for security, specific errors logged
+            wp_send_json_error(['message' => 'ログインに失敗しました。ユーザー名またはパスワードが間違っています。']);
+        } else {
+            error_log('[Edel Stripe Login] wp_signon successful for user ID: ' . $user->ID);
+            // Set current user - wp_signon usually handles this, but double check if needed
+            // wp_set_current_user($user->ID);
+            wp_send_json_success(['message' => 'ログインしました。リダイレクトします...', 'redirect_url' => $redirect_url]);
+        }
+    } // end ajax_do_login
 
     /**
-     * ★新規追加: Renders the [edel_stripe_my_account] shortcode content.
-     * Displays subscription status and payment history for logged-in users.
+     * Renders the [edel_stripe_login] shortcode content.
+     * Displays a custom login form with potential reCAPTCHA integration.
      *
      * @param array $atts Shortcode attributes (currently unused).
-     * @return string HTML output for the my account page.
+     * @return string HTML output for the login form.
      */
-    public function render_my_account_page($atts) {
-        $log_prefix = '[Edel Stripe MyAccount] '; // ★ 追加：ログ接頭辞を定義
-        error_log($log_prefix . 'Shortcode rendering started.');
-
-        // Check if user is logged in
-        if (!is_user_logged_in()) {
-            return '<p>このコンテンツを表示するには<a href="' . esc_url(wp_login_url(get_permalink())) . '">ログイン</a>してください。</p>';
+    public function render_login_form($atts) {
+        // If user is already logged in, show a message and logout link
+        if (is_user_logged_in()) {
+            $current_user = wp_get_current_user();
+            return sprintf(
+                '<div class="edel-stripe-login-wrap"><p>%s としてログイン済みです。</p><p><a href="%s">ログアウト</a></p></div>',
+                esc_html($current_user->display_name),
+                esc_url(wp_logout_url(get_permalink())) // Redirect back to current page after logout
+            );
         }
 
-        // Get current user data
-        $user_id = get_current_user_id();
-        $user = get_userdata($user_id);
-        if (!$user) {
-            return '<p>ユーザー情報の取得に失敗しました。</p>';
-        }
+        // Get settings needed for the form
+        $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+        $enable_recaptcha = $options['login_enable_recaptcha'] ?? '0';
+        $recaptcha_site_key = $options['login_recaptcha_site_key'] ?? '';
+        $redirect_page_id = $options['login_redirect_page_id'] ?? 0;
 
-        // Get saved data from user meta
-        $subscription_id = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_id', true);
-        $subscription_status_meta = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', true);
-        $customer_id = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'customer_id', true);
-        error_log($log_prefix . "UserID: {$user_id}, SubID from Meta: {$subscription_id}, Status from Meta: {$subscription_status_meta}");
-
-        // Variables to store fetched Stripe data
-        $stripe_subscription = null;
-        $stripe_error_message = '';
-        $plan_details_str = 'プラン情報取得中...'; // Default text
-        $next_billing_str = '取得中...';
-        $cancel_at_str = '';
-        $current_status_from_stripe = $subscription_status_meta ?: '不明'; // Use meta as fallback
-
-        // --- Fetch current subscription details from Stripe API if ID exists ---
-        if ($subscription_id) {
-            $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
-            $is_live_mode = isset($options['mode']) && $options['mode'] === 'live';
-            $secret_key = $is_live_mode ? ($options['live_secret_key'] ?? '') : ($options['test_secret_key'] ?? '');
-
-            if (!empty($secret_key)) {
-                error_log($log_prefix . "Attempting to retrieve Stripe subscription: {$subscription_id}");
-                try {
-                    $stripe = new \Stripe\StripeClient($secret_key);
-                    \Stripe\Stripe::setApiVersion("2024-04-10");
-
-                    // Retrieve subscription and expand plan and product info
-                    $stripe_subscription = $stripe->subscriptions->retrieve($subscription_id, ['expand' => ['plan.product']]);
-                    error_log($log_prefix . "Stripe API Retrieve successful. Status: " . ($stripe_subscription->status ?? 'N/A')); // ★ Log Stripe status
-
-                    if ($stripe_subscription) {
-                        error_log($log_prefix . "Stripe API Retrieve successful. Status from Stripe: " . ($stripe_subscription->status ?? 'N/A')); // ★ Stripeからのステータスをログ出力
-                        $current_status_from_stripe = $stripe_subscription->status; // Get the most current status
-
-                        // Format plan details for display
-                        $plan = $stripe_subscription->plan;
-                        if ($plan) {
-                            $plan_amount = $plan->amount ?? 0;
-                            $plan_currency = $plan->currency ?? 'jpy';
-                            $plan_interval = $plan->interval ?? '?';
-                            $plan_interval_count = $plan->interval_count ?? 1;
-                            $product_name = ($plan->product && is_string($plan->product->name)) ? $plan->product->name : '不明な商品';
-
-                            $amount_str = '';
-                            if ($plan_currency === 'jpy') {
-                                $amount_str = number_format($plan_amount) . '円';
-                            } elseif ($plan_currency === 'usd') {
-                                $amount_str = '$' . number_format($plan_amount / 100, 2);
-                            } else {
-                                $amount_str = number_format($plan_amount) . ' ' . strtoupper($plan_currency);
-                            }
-
-                            $interval_str = '';
-                            if ($plan_interval_count == 1) {
-                                if ($plan_interval == 'month') $interval_str = '月';
-                                elseif ($plan_interval == 'year') $interval_str = '年';
-                                elseif ($plan_interval == 'week') $interval_str = '週';
-                                elseif ($plan_interval == 'day') $interval_str = '日';
-                                else $interval_str = $plan_interval; // 不明な間隔はそのまま表示
-                            } else {
-                                $interval_str = $plan_interval_count . ' ';
-                                if ($plan_interval == 'month') $interval_str .= 'ヶ月';
-                                elseif ($plan_interval == 'year') $interval_str .= '年';
-                                elseif ($plan_interval == 'week') $interval_str .= '週間'; // 複数週対応
-                                elseif ($plan_interval == 'day') $interval_str .= '日間'; // 複数日対応
-                                else $interval_str .= $plan_interval; // 不明な間隔
-                            }
-
-                            $plan_details_str = esc_html($product_name) . ' (' . $amount_str . ' / ' . esc_html($interval_str) . ')';
-                        } else {
-                            $plan_details_str = 'プラン情報取得失敗';
-                        }
-                        error_log($log_prefix . "Plan Details String: " . $plan_details_str); // ★ ログ出力
-
-                        // Format next billing date
-                        if ($stripe_subscription->current_period_end) {
-                            if ($stripe_subscription->status === 'active' || $stripe_subscription->status === 'trialing') {
-                                $next_billing_str = wp_date(get_option('date_format'), $stripe_subscription->current_period_end);
-                            } else {
-                                $next_billing_str = '---'; // No next billing if inactive
-                            }
-                        } else {
-                            $next_billing_str = '---';
-                        }
-                        error_log($log_prefix . "Next Billing String: " . $next_billing_str); // ★ ログ出力
-
-                        // Check if cancellation is scheduled
-                        if ($stripe_subscription->cancel_at_period_end) {
-                            $cancel_at_str = ' (期間終了時 ' . wp_date(get_option('date_format'), $stripe_subscription->current_period_end) . ' にキャンセル予定)';
-                        }
-                        error_log($log_prefix . "Cancel at Period End: " . ($stripe_subscription->cancel_at_period_end ? 'Yes' : 'No')); // ★ ログ出力
-
-                        // Update user meta status if different from Stripe (optional sync here)
-                        if ($current_status_from_stripe !== $subscription_status_meta) {
-                            update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', $current_status_from_stripe);
-                            error_log("[Edel Stripe MyAccount] Synced status for User ID {$user_id} to '{$current_status_from_stripe}'");
-                            // Optionally update role here too, mirroring webhook logic
-                        }
-                    } // end if $stripe_subscription
-                } catch (\Stripe\Exception\ApiErrorException $e) {
-                    $stripe_error_message = 'Stripe APIエラー: ' . $e->getMessage();
-                    error_log(EDEL_STRIPE_PAYMENT_PREFIX . $stripe_error_message);
-                    $plan_details_str = '取得エラー';
-                    $next_billing_str = '取得エラー';
-                } catch (Exception $e) {
-                    $stripe_error_message = 'サブスクリプション情報の取得中にエラーが発生しました。';
-                    error_log(EDEL_STRIPE_PAYMENT_PREFIX . $stripe_error_message . $e->getMessage());
-                    $plan_details_str = '取得エラー';
-                    $next_billing_str = '取得エラー';
-                } finally {
-                    \Stripe\Stripe::setApiKey(null);
-                }
-            } else {
-                $stripe_error_message = 'Stripe APIキーが設定されていません。';
-                $plan_details_str = '取得不可';
-                $next_billing_str = '取得不可';
-            }
+        // Determine redirect URL
+        $redirect_url = '';
+        if ($redirect_page_id && get_post_status($redirect_page_id) === 'publish') {
+            $redirect_url = get_permalink($redirect_page_id);
         } else {
-            error_log($log_prefix . 'No subscription ID found in user meta.');
+            // Default redirect (e.g., to admin dashboard or current page)
+            // Using admin_url() might be a sensible default if no page is set
+            $redirect_url = admin_url();
+            // Or redirect back to the same page: $redirect_url = get_permalink();
         }
 
-        error_log($log_prefix . 'Final Status for Display: ' . $current_status_from_stripe); // ★ Log final status variable
+        // Prepare Nonce for AJAX login action
+        $login_nonce = wp_create_nonce(EDEL_STRIPE_PAYMENT_PREFIX . 'login_nonce');
+        $ajax_action_name = 'edel_stripe_do_login'; // Define the AJAX action name
 
-
-        // --- Fetch Payment History ---
-        global $wpdb;
-        $payment_table = $wpdb->prefix . EDEL_STRIPE_PAYMENT_PREFIX . 'main';
-        $payments = $wpdb->get_results($wpdb->prepare(
-            "SELECT * FROM {$payment_table} WHERE user_id = %d ORDER BY created_at_gmt DESC LIMIT 50", // Get latest 50 payments
-            $user_id
-        ), ARRAY_A);
-
-
-        // --- Start Output Buffering ---
+        // Start output buffering
         ob_start();
 ?>
+        <div class="edel-stripe-login-wrap edel-stripe-payment-form-wrap"> <?php // Reuse existing wrapper class for some basic styling?
+                                                                            ?>
+            <form id="edel-stripe-login-form" method="post">
+                <h2>ログイン</h2> <?php // Simple Title
+                                ?>
+                <div id="edel-login-messages" class="edel-stripe-result-message" style="display: none;"></div> <?php // Area for error/success messages
+                                                                                                                ?>
+
+                <div class="form-row">
+                    <label for="edel-log">ユーザー名またはメールアドレス</label>
+                    <input type="text" name="log" id="edel-log" class="input edel-stripe-email-input" value="" size="20" required>
+                </div>
+                <div class="form-row">
+                    <label for="edel-pwd">パスワード</label>
+                    <input type="password" name="pwd" id="edel-pwd" class="input edel-stripe-email-input" value="" size="20" required autocomplete="current-password">
+                </div>
+
+                <?php // Optional: Remember Me & Lost Password
+                ?>
+                <p class="login-remember"><label><input name="rememberme" type="checkbox" id="edel-rememberme" value="forever"> ログイン状態を保存する</label></p>
+                <p class="login-lost-password">
+                    <a href="<?php echo esc_url(wp_lostpassword_url()); ?>">パスワードをお忘れですか？</a>
+                </p>
+                <?php // Add Lost Password link if needed: wp_lostpassword_url()
+                ?>
+                <?php /* <p class="login-lost-password"><a href="<?php echo esc_url( wp_lostpassword_url() ); ?>">パスワードをお忘れですか？</a></p> */ ?>
+
+
+                <?php // Hidden fields for AJAX processing
+                ?>
+                <input type="hidden" name="action" value="<?php echo esc_attr($ajax_action_name); ?>">
+                <input type="hidden" name="security" value="<?php echo esc_attr($login_nonce); ?>">
+                <input type="hidden" name="redirect_to" value="<?php echo esc_url($redirect_url); ?>">
+
+                <?php // reCAPTCHA placeholder and hidden input (if enabled)
+                ?>
+                <?php if ($enable_recaptcha === '1' && !empty($recaptcha_site_key)): ?>
+                    <input type="hidden" name="g-recaptcha-response" id="g-recaptcha-response-login">
+                    <p class="recaptcha-notice" style="font-size: 0.8em; color: #666;">
+                        このサイトは reCAPTCHA と Google によって保護されており、
+                        <a href="https://policies.google.com/privacy" target="_blank" rel="noopener">プライバシーポリシー</a>と
+                        <a href="https://policies.google.com/terms" target="_blank" rel="noopener">利用規約</a>が適用されます。
+                    </p>
+                    <?php // Enqueue reCAPTCHA script if needed (can also be done in front_enqueue)
+                    // wp_enqueue_script('google-recaptcha', 'https://www.google.com/recaptcha/api.js?render=' . esc_attr($recaptcha_site_key), array(), null, true);
+                    ?>
+                <?php endif; ?>
+
+                <p class="login-submit">
+                    <button type="submit" name="wp-submit" id="edel-login-submit" class="button button-primary edel-stripe-submit-button">ログイン</button>
+                    <span class="spinner edel-stripe-spinner" style="display: none; vertical-align: middle; margin-left: 5px;"></span>
+                </p>
+            </form>
+        </div><?php
+                // We will need JS to handle the AJAX submission and reCAPTCHA
+                // $this->add_frontend_scripts = true; // Ensure scripts load if using conditional logic
+                return ob_get_clean();
+            } // end render_login_form
+
+            /**
+             * Registers the REST API endpoint for Stripe Webhooks.
+             */
+            public function register_webhook_endpoint() {
+                error_log('[Edel Stripe REST] Attempting to register webhook endpoint /edel-stripe/v1/webhook...'); // ★ Log Start
+
+                $registered = register_rest_route(
+                    'edel-stripe/v1', // Namespace
+                    '/webhook',       // Route
+                    array(
+                        'methods'             => 'POST', // Accept only POST requests
+                        'callback'            => array($this, 'handle_webhook'), // Callback function
+                        'permission_callback' => '__return_true', // Allow public access (Stripe needs to reach it) - Security is handled by signature verification
+                    )
+                );
+                if ($registered) {
+                    error_log('[Edel Stripe REST] Webhook endpoint registered successfully.');
+                } else {
+                    error_log('[Edel Stripe REST] FAILED to register webhook endpoint!');
+                }
+            }
+
+            /**
+             * Filters the login redirect URL.
+             * Redirects non-admins to the specified My Account page after login via wp-login.php.
+             *
+             * @param string   $redirect_to           The redirect destination URL.
+             * @param string   $requested_redirect_to The URL the user is attempting to redirect to.
+             * @param WP_User|WP_Error $user          WP_User object if login was successful, WP_Error object otherwise.
+             * @return string Redirect URL.
+             */
+            public function filter_login_redirect($redirect_to, $requested_redirect_to, $user) {
+                // エラー発生時や管理者にはデフォルトの動作をさせる
+                if (is_wp_error($user) || user_can($user, 'manage_options')) {
+                    return $redirect_to; // 通常は /wp-admin/
+                }
+
+                // 設定からマイアカウントページのIDを取得
+                $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+                $my_account_page_id = $options['my_account_page_id'] ?? 0;
+
+                // マイアカウントページが設定されていて、公開されているか確認
+                if ($my_account_page_id && get_post_status($my_account_page_id) === 'publish') {
+                    $my_account_url = get_permalink($my_account_page_id);
+                    error_log('[Edel Stripe Login Redirect] Redirecting non-admin user ID ' . $user->ID . ' to My Account page: ' . $my_account_url);
+                    return $my_account_url; // マイアカウントページへリダイレクト
+                }
+
+                // マイアカウントページが未設定なら、サイトのトップページへリダイレクト（または $redirect_to のまま）
+                error_log('[Edel Stripe Login Redirect] My Account page not set. Redirecting non-admin user ID ' . $user->ID . ' to home.');
+                return home_url();
+            } // end filter_login_redirect
+
+            /**
+             * Renders the [edel_stripe_my_account] shortcode content.
+             * Displays subscription status and payment history for logged-in users.
+             *
+             * @param array $atts Shortcode attributes (currently unused).
+             * @return string HTML output for the my account page.
+             */
+            public function render_my_account_page($atts) {
+                $log_prefix = '[Edel Stripe MyAccount] '; // ★ 追加：ログ接頭辞を定義
+                error_log($log_prefix . 'Shortcode rendering started.');
+
+                // Check if user is logged in
+                if (!is_user_logged_in()) {
+                    return '<p>このコンテンツを表示するには<a href="' . esc_url(wp_login_url(get_permalink())) . '">ログイン</a>してください。</p>';
+                }
+
+                // Get current user data
+                $user_id = get_current_user_id();
+                $user = get_userdata($user_id);
+                if (!$user) {
+                    return '<p>ユーザー情報の取得に失敗しました。</p>';
+                }
+
+                // Get saved data from user meta
+                $subscription_id = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_id', true);
+                $subscription_status_meta = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', true);
+                $customer_id = get_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'customer_id', true);
+                error_log($log_prefix . "UserID: {$user_id}, SubID from Meta: {$subscription_id}, Status from Meta: {$subscription_status_meta}");
+
+                // Variables to store fetched Stripe data
+                $stripe_subscription = null;
+                $stripe_error_message = '';
+                $plan_details_str = 'プラン情報取得中...'; // Default text
+                $next_billing_str = '取得中...';
+                $cancel_at_str = '';
+                $current_status_from_stripe = $subscription_status_meta ?: '不明'; // Use meta as fallback
+
+                // --- Fetch current subscription details from Stripe API if ID exists ---
+                if ($subscription_id) {
+                    $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+                    $is_live_mode = isset($options['mode']) && $options['mode'] === 'live';
+                    $secret_key = $is_live_mode ? ($options['live_secret_key'] ?? '') : ($options['test_secret_key'] ?? '');
+
+                    if (!empty($secret_key)) {
+                        error_log($log_prefix . "Attempting to retrieve Stripe subscription: {$subscription_id}");
+                        try {
+                            $stripe = new \Stripe\StripeClient($secret_key);
+                            \Stripe\Stripe::setApiVersion("2024-04-10");
+
+                            // Retrieve subscription and expand plan and product info
+                            $stripe_subscription = $stripe->subscriptions->retrieve($subscription_id, ['expand' => ['plan.product']]);
+                            error_log($log_prefix . "Stripe API Retrieve successful. Status: " . ($stripe_subscription->status ?? 'N/A')); // ★ Log Stripe status
+
+                            if ($stripe_subscription) {
+                                error_log($log_prefix . "Stripe API Retrieve successful. Status from Stripe: " . ($stripe_subscription->status ?? 'N/A')); // ★ Stripeからのステータスをログ出力
+                                $current_status_from_stripe = $stripe_subscription->status; // Get the most current status
+
+                                // Format plan details for display
+                                $plan = $stripe_subscription->plan;
+                                if ($plan) {
+                                    $plan_amount = $plan->amount ?? 0;
+                                    $plan_currency = $plan->currency ?? 'jpy';
+                                    $plan_interval = $plan->interval ?? '?';
+                                    $plan_interval_count = $plan->interval_count ?? 1;
+                                    $product_name = ($plan->product && is_string($plan->product->name)) ? $plan->product->name : '不明な商品';
+
+                                    $amount_str = '';
+                                    if ($plan_currency === 'jpy') {
+                                        $amount_str = number_format($plan_amount) . '円';
+                                    } elseif ($plan_currency === 'usd') {
+                                        $amount_str = '$' . number_format($plan_amount / 100, 2);
+                                    } else {
+                                        $amount_str = number_format($plan_amount) . ' ' . strtoupper($plan_currency);
+                                    }
+
+                                    $interval_str = '';
+                                    if ($plan_interval_count == 1) {
+                                        if ($plan_interval == 'month') $interval_str = '月';
+                                        elseif ($plan_interval == 'year') $interval_str = '年';
+                                        elseif ($plan_interval == 'week') $interval_str = '週';
+                                        elseif ($plan_interval == 'day') $interval_str = '日';
+                                        else $interval_str = $plan_interval; // 不明な間隔はそのまま表示
+                                    } else {
+                                        $interval_str = $plan_interval_count . ' ';
+                                        if ($plan_interval == 'month') $interval_str .= 'ヶ月';
+                                        elseif ($plan_interval == 'year') $interval_str .= '年';
+                                        elseif ($plan_interval == 'week') $interval_str .= '週間'; // 複数週対応
+                                        elseif ($plan_interval == 'day') $interval_str .= '日間'; // 複数日対応
+                                        else $interval_str .= $plan_interval; // 不明な間隔
+                                    }
+
+                                    $plan_details_str = esc_html($product_name) . ' (' . $amount_str . ' / ' . esc_html($interval_str) . ')';
+                                } else {
+                                    $plan_details_str = 'プラン情報取得失敗';
+                                }
+                                error_log($log_prefix . "Plan Details String: " . $plan_details_str); // ★ ログ出力
+
+                                // Format next billing date
+                                if ($stripe_subscription->current_period_end) {
+                                    if ($stripe_subscription->status === 'active' || $stripe_subscription->status === 'trialing') {
+                                        $next_billing_str = wp_date(get_option('date_format'), $stripe_subscription->current_period_end);
+                                    } else {
+                                        $next_billing_str = '---'; // No next billing if inactive
+                                    }
+                                } else {
+                                    $next_billing_str = '---';
+                                }
+                                error_log($log_prefix . "Next Billing String: " . $next_billing_str); // ★ ログ出力
+
+                                // Check if cancellation is scheduled
+                                if ($stripe_subscription->cancel_at_period_end) {
+                                    $cancel_at_str = ' (期間終了時 ' . wp_date(get_option('date_format'), $stripe_subscription->current_period_end) . ' にキャンセル予定)';
+                                }
+                                error_log($log_prefix . "Cancel at Period End: " . ($stripe_subscription->cancel_at_period_end ? 'Yes' : 'No')); // ★ ログ出力
+
+                                // Update user meta status if different from Stripe (optional sync here)
+                                if ($current_status_from_stripe !== $subscription_status_meta) {
+                                    update_user_meta($user_id, EDEL_STRIPE_PAYMENT_PREFIX . 'subscription_status', $current_status_from_stripe);
+                                    error_log("[Edel Stripe MyAccount] Synced status for User ID {$user_id} to '{$current_status_from_stripe}'");
+                                    // Optionally update role here too, mirroring webhook logic
+                                }
+                            } // end if $stripe_subscription
+                        } catch (\Stripe\Exception\ApiErrorException $e) {
+                            $stripe_error_message = 'Stripe APIエラー: ' . $e->getMessage();
+                            error_log(EDEL_STRIPE_PAYMENT_PREFIX . $stripe_error_message);
+                            $plan_details_str = '取得エラー';
+                            $next_billing_str = '取得エラー';
+                        } catch (Exception $e) {
+                            $stripe_error_message = 'サブスクリプション情報の取得中にエラーが発生しました。';
+                            error_log(EDEL_STRIPE_PAYMENT_PREFIX . $stripe_error_message . $e->getMessage());
+                            $plan_details_str = '取得エラー';
+                            $next_billing_str = '取得エラー';
+                        } finally {
+                            \Stripe\Stripe::setApiKey(null);
+                        }
+                    } else {
+                        $stripe_error_message = 'Stripe APIキーが設定されていません。';
+                        $plan_details_str = '取得不可';
+                        $next_billing_str = '取得不可';
+                    }
+                } else {
+                    error_log($log_prefix . 'No subscription ID found in user meta.');
+                }
+
+                error_log($log_prefix . 'Final Status for Display: ' . $current_status_from_stripe); // ★ Log final status variable
+
+
+                // --- Fetch Payment History ---
+                global $wpdb;
+                $payment_table = $wpdb->prefix . EDEL_STRIPE_PAYMENT_PREFIX . 'main';
+                $payments = $wpdb->get_results($wpdb->prepare(
+                    "SELECT * FROM {$payment_table} WHERE user_id = %d ORDER BY created_at_gmt DESC LIMIT 50", // Get latest 50 payments
+                    $user_id
+                ), ARRAY_A);
+
+
+                // --- Start Output Buffering ---
+                ob_start();
+                ?>
         <div class="edel-stripe-my-account-wrap">
 
             <h2>ご契約情報</h2>
@@ -266,6 +510,10 @@ class EdelStripePaymentFront {
                 <p>現在、有効なサブスクリプション契約はありません。</p>
             <?php endif; ?>
 
+            <div class="edel-stripe-profile-link" style="margin-top: 20px;">
+                <p><a href="<?php echo esc_url(admin_url('profile.php')); ?>" class="button button-secondary edel-stripe-logout-link">プロフィール情報を編集する（パスワード変更はこちら）</a></p>
+            </div>
+
             <hr style="margin: 30px 0;">
 
             <h2>決済履歴</h2>
@@ -324,6 +572,9 @@ class EdelStripePaymentFront {
                 <?php else: ?>
                     <p>決済履歴はありません。</p>
                 <?php endif; ?>
+            </div>
+            <div class="edel-stripe-logout-section" style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; text-align: right;">
+                <a href="<?php echo esc_url(wp_logout_url(get_permalink())); ?>" class="edel-stripe-logout-link">ログアウト</a>
             </div>
 
         </div><?php
@@ -1044,11 +1295,36 @@ class EdelStripePaymentFront {
                 $default_success_message = "支払いが完了しました。ありがとうございます。\nメールをご確認ください。届いていない場合は、お問い合わせください。";
                 $frontend_success_message = $stripe_options['frontend_success_message'] ?? $default_success_message;
 
+                $login_enable_recaptcha = $stripe_options['login_enable_recaptcha'] ?? '0';
+                $login_recaptcha_site_key = $stripe_options['login_recaptcha_site_key'] ?? '';
+
+                error_log('[Edel Stripe Enqueue] check1.');
+
+                // reCAPTCHA v3 APIスクリプトを条件付きで読み込む
+                if ($login_enable_recaptcha === '1' && !empty($login_recaptcha_site_key)) {
+                    error_log('[Edel Stripe Enqueue] check2.');
+                    // Make sure we are on a singular page/post
+                    if (is_singular()) {
+                        error_log('[Edel Stripe Enqueue] check3.');
+                        global $post; // Get the global post object
+                        // Check if the post object exists and contains the shortcode
+                        if (is_a($post, 'WP_Post') && has_shortcode($post->post_content, 'edel_stripe_login')) {
+                            error_log('[Edel Stripe Enqueue] check4.');
+                            wp_enqueue_script('google-recaptcha-v3', 'https://www.google.com/recaptcha/api.js?render=' . esc_attr($login_recaptcha_site_key), array(), null, true);
+                            error_log('[Edel Stripe Enqueue] Enqueuing reCAPTCHA script for login form.'); // Optional log
+                        }
+                    }
+                    // Note: This check might not detect shortcodes in widgets or theme options etc.
+                }
+
                 $params = array(
                     'ajax_url' => admin_url('admin-ajax.php'),
                     'publishable_key' => $publishable_key,
                     'record_nonce' => wp_create_nonce(EDEL_STRIPE_PAYMENT_PREFIX . 'record_payment_nonce'),
                     'success_message' => $frontend_success_message,
+                    'login_recaptcha_enabled' => $login_enable_recaptcha,
+                    'login_recaptcha_site_key' => $login_recaptcha_site_key,
+                    'login_ajax_action' => 'edel_stripe_do_login',
                 );
                 wp_localize_script(EDEL_STRIPE_PAYMENT_SLUG . '-front', 'edelStripeParams', $params);
             }
@@ -1056,12 +1332,14 @@ class EdelStripePaymentFront {
             public function render_subscription_shortcode($atts) {
                 // --- Step 1: Process Shortcode Attributes ---
                 $attributes = shortcode_atts(array(
-                    'plan_id'     => '', // Stripe Price ID (必須)
-                    'button_text' => '申し込む', // Default button text
+                    'plan_id'     => '',
+                    'button_text' => '申し込む',
+                    'trial_days'  => 0,
                 ), $atts);
 
                 $plan_id = sanitize_text_field($attributes['plan_id']);
                 $button_text = sanitize_text_field($attributes['button_text']);
+                $trial_days = max(0, intval($attributes['trial_days']));
 
                 if (empty($plan_id) || strpos($plan_id, 'price_') !== 0) {
                     if (current_user_can('manage_options')) {
@@ -1107,8 +1385,8 @@ class EdelStripePaymentFront {
                 ?>
                 <input type="hidden" name="plan_id" value="<?php echo esc_attr($plan_id); ?>">
                 <input type="hidden" name="action" value="edel_stripe_process_subscription">
-                <input type="hidden" name="subscription_security" value="<?php echo esc_attr($nonce); ?>"> <?php // Correct nonce name
-                                                                                                            ?>
+                <input type="hidden" name="subscription_security" value="<?php echo esc_attr($nonce); ?>">
+                <input type="hidden" name="trial_days" value="<?php echo esc_attr($trial_days); ?>">
 
                 <?php // --- ★修正: Conditional Consent Checkbox Output (with text generation) ---
                 ?>
@@ -1187,6 +1465,8 @@ class EdelStripePaymentFront {
                 // --- Step 2: Get Data from POST ---
                 $plan_id = isset($_POST['plan_id']) ? sanitize_text_field($_POST['plan_id']) : null;
                 $email   = isset($_POST['email']) ? sanitize_email($_POST['email']) : null;
+                $trial_days = isset($_POST['trial_days']) ? max(0, intval($_POST['trial_days'])) : 0;
+
                 error_log('[Edel Stripe Sub Process] POST Data - Plan ID: ' . $plan_id . ' | Email: ' . $email);
 
                 // --- Step 3: Basic Validation ---
@@ -1234,7 +1514,7 @@ class EdelStripePaymentFront {
                     }
 
                     // 2. Create Subscription
-                    $subscription_params = [ /* ... (前回と同じパラメータ) ... */
+                    $subscription_params = [
                         'customer' => $customer_id,
                         'items' => [['price' => $plan_id]],
                         'payment_behavior' => 'default_incomplete',
@@ -1242,6 +1522,12 @@ class EdelStripePaymentFront {
                         'expand' => ['latest_invoice.payment_intent'],
                         'metadata' => ['wordpress_user_email' => $email, 'wordpress_site' => home_url()]
                     ];
+
+                    // ★ 条件に応じてトライアルパラメータを追加 ★
+                    if ($trial_days > 0) {
+                        $subscription_params['trial_period_days'] = $trial_days;
+                        error_log("[Edel Stripe Sub Process] Adding trial_period_days: " . $trial_days);
+                    }
                     error_log("[Edel Stripe Sub Process] Attempting to create subscription..."); // ★ Log Before Sub Create
                     $subscription = \Stripe\Subscription::create($subscription_params);
                     error_log("[Edel Stripe Sub Process] Subscription created (" . $subscription->id . "). Status: " . $subscription->status); // ★ Log After Sub Create
@@ -1341,13 +1627,30 @@ class EdelStripePaymentFront {
                         error_log("Edel Stripe: New user created: ID " . $user_id . " | Stripe Customer ID saved: " . $customer_id);
 
                         // --- Disable standard new user notification email ---
+                        /*
                         $disable_user_email_callback = function ($wp_new_user_notification_email, $user, $blogname) {
                             return false;
                         };
                         add_filter('wp_new_user_notification_email', $disable_user_email_callback, 10, 3);
+                        */
                         wp_new_user_notification($user_id, null, 'user');
+                        /*
                         remove_filter('wp_new_user_notification_email', $disable_user_email_callback, 10);
+                        */
                         // --- End disable standard new user notification ---
+
+                        $options = get_option(EDEL_STRIPE_PAYMENT_PREFIX . 'options', []);
+                        $auto_login = $options['auto_login_on_purchase'] ?? '0'; // 設定値を取得
+
+                        if ($auto_login === '1') {
+                            error_log("Edel Stripe: Attempting auto-login for new user ID: " . $user_id);
+                            wp_clear_auth_cookie(); // Clear any existing cookies first
+                            wp_set_current_user($user_id); // Set the current user for this request
+                            wp_set_auth_cookie($user_id, true); // Set the login cookie (true = remember user)
+                            error_log("Edel Stripe: Auto-login cookies set for user ID: " . $user_id);
+                        } else {
+                            error_log("Edel Stripe: Auto-login disabled in settings.");
+                        }
                     }
                 } // End user check/creation block
 

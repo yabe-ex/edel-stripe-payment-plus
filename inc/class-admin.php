@@ -401,6 +401,9 @@ class EdelStripePaymentAdmin {
             $options['mail_from_name']       = isset($_POST['mail_from_name']) ? sanitize_text_field($_POST['mail_from_name']) : '';
             $options['mail_from_email']      = isset($_POST['mail_from_email']) ? sanitize_email($_POST['mail_from_email']) : '';
             $options['admin_notify_email']   = isset($_POST['admin_notify_email']) ? sanitize_email($_POST['admin_notify_email']) : '';
+            $options['auto_login_on_purchase'] = isset($_POST['auto_login_on_purchase']) ? '1' : '0';
+            $options['my_account_page_id'] = isset($_POST['my_account_page_id']) ? intval($_POST['my_account_page_id']) : 0;
+
             // メール形式検証
             if (!empty($options['mail_from_email']) && !is_email($options['mail_from_email'])) {
                 add_settings_error('edel_stripe_options', 'invalid_from_email', '共通設定: 送信元メールアドレスの形式が正しくありません。');
@@ -430,6 +433,17 @@ class EdelStripePaymentAdmin {
             $options['sub_admin_mail_body']     = isset($_POST['sub_admin_mail_body']) ? wp_kses_post($_POST['sub_admin_mail_body']) : '';
             $options['sub_customer_mail_subject'] = isset($_POST['sub_customer_mail_subject']) ? sanitize_text_field($_POST['sub_customer_mail_subject']) : '';
             $options['sub_customer_mail_body']  = isset($_POST['sub_customer_mail_body']) ? wp_kses_post($_POST['sub_customer_mail_body']) : '';
+
+            // === ★↓ ログイン設定 ↓★ ===
+            $options['login_enable_recaptcha'] = isset($_POST['login_enable_recaptcha']) ? '1' : '0';
+            $options['login_recaptcha_site_key'] = isset($_POST['login_recaptcha_site_key']) ? sanitize_text_field(trim($_POST['login_recaptcha_site_key'])) : '';
+            $options['login_recaptcha_secret_key'] = isset($_POST['login_recaptcha_secret_key']) ? sanitize_text_field(trim($_POST['login_recaptcha_secret_key'])) : '';
+            $options['login_recaptcha_threshold'] = isset($_POST['login_recaptcha_threshold']) ? floatval($_POST['login_recaptcha_threshold']) : 0.5;
+            // スコアは0.0から1.0の範囲に収める
+            if ($options['login_recaptcha_threshold'] < 0.0) $options['login_recaptcha_threshold'] = 0.0;
+            if ($options['login_recaptcha_threshold'] > 1.0) $options['login_recaptcha_threshold'] = 1.0;
+            $options['login_redirect_page_id'] = isset($_POST['login_redirect_page_id']) ? intval($_POST['login_redirect_page_id']) : 0;
+
 
             // 支払い失敗時メール設定の取得・サニタイズ
             $options['sub_fail_send_admin'] = isset($_POST['sub_fail_send_admin']) ? '1' : '0';
@@ -562,6 +576,14 @@ class EdelStripePaymentAdmin {
         $sub_cancel_customer_body = $options['sub_cancel_customer_body'] ?? $default_sub_cancel_customer_body;
         $delete_data_on_uninstall = $options['delete_data_on_uninstall'] ?? '0'; // デフォルトは OFF ('0')
 
+        // ★↓ 自動ログイン設定読み込み ↓★
+        $auto_login_on_purchase = $options['auto_login_on_purchase'] ?? '0'; // Default OFF
+        $login_enable_recaptcha = $options['login_enable_recaptcha'] ?? '0'; // Default OFF
+        $login_recaptcha_site_key = $options['login_recaptcha_site_key'] ?? '';
+        $login_recaptcha_secret_key = $options['login_recaptcha_secret_key'] ?? '';
+        $login_recaptcha_threshold = $options['login_recaptcha_threshold'] ?? 0.5;
+        $login_redirect_page_id = $options['login_redirect_page_id'] ?? 0;
+        $my_account_page_id = $options['my_account_page_id'] ?? 0;
 
         // Placeholders list
         $placeholders = '<code>{item_name}</code>, <code>{amount}</code>, <code>{customer_email}</code>, <code>{payment_intent_id}</code>(買い切り), <code>{customer_id}</code>, <code>{transaction_date}</code>, <code>{user_name}</code>, <code>{user_id}</code>, <code>{site_name}</code>, <code>{site_url}</code>, <code>{subscription_id}</code>(サブスク), <code>{plan_id}</code>(サブスク)';
@@ -577,6 +599,7 @@ class EdelStripePaymentAdmin {
                 <a href="#tab-common" class="nav-tab nav-tab-active">共通設定</a>
                 <a href="#tab-onetime" class="nav-tab">買い切り設定</a>
                 <a href="#tab-subscription" class="nav-tab">サブスク設定</a>
+                <a href="#tab-login" class="nav-tab">ログイン設定</a>
             </nav>
 
             <form method="POST">
@@ -702,8 +725,7 @@ class EdelStripePaymentAdmin {
                         </tr>
                         <tr>
                             <th><label for="ot_admin_mail_subject">件名</label></th>
-                            <td><input type="text" id="ot_admin_mail_subject" name="ot_admin_mail_subject" value="<?php echo esc_attr($ot_admin_mail_subject); ?>" class="large-text" placeholder="<?php echo esc_attr($default_admin_subject); // Use default as placeholder
-                                                                                                                                                                                                    ?>"></td>
+                            <td><input type="text" id="ot_admin_mail_subject" name="ot_admin_mail_subject" value="<?php echo esc_attr($ot_admin_mail_subject); ?>" class="large-text" placeholder="<?php echo esc_attr($default_ot_admin_subject); ?>"></td>
                         </tr>
                         <tr>
                             <th><label for="ot_admin_mail_body">本文</label></th>
@@ -724,7 +746,7 @@ class EdelStripePaymentAdmin {
                         </tr>
                         <tr>
                             <th><label for="ot_customer_mail_subject">件名</label></th>
-                            <td><input type="text" id="ot_customer_mail_subject" name="ot_customer_mail_subject" value="<?php echo esc_attr($ot_customer_mail_subject); ?>" class="large-text" placeholder="<?php echo esc_attr($default_customer_subject); ?>"></td>
+                            <td><input type="text" id="ot_customer_mail_subject" name="ot_customer_mail_subject" value="<?php echo esc_attr($ot_customer_mail_subject); ?>" class="large-text" placeholder="<?php echo esc_attr($default_ot_customer_subject); ?>"></td>
                         </tr>
                         <tr>
                             <th><label for="ot_customer_mail_body">本文</label></th>
@@ -786,9 +808,9 @@ class EdelStripePaymentAdmin {
                                     if ($interval == 'month') $interval_str .= $interval_count > 1 ? 'ヶ月' : '月';
                                     elseif ($interval == 'year') $interval_str .= $interval_count > 1 ? '年' : '年';
                                     else $interval_str .= $interval;
-                                    $trial_str = ($price->recurring->trial_period_days) ? $price->recurring->trial_period_days . '日間' : 'なし';
+
                                     $amount_str = isset($price->unit_amount) ? number_format($price->unit_amount) . '円' : '?';
-                                    $display_data[] = ['product_name' => $product_name, 'price_id' => $price->id, 'amount_str' => $amount_str . ' / ' . esc_html($interval_str), 'trial_str' => $trial_str];
+                                    $display_data[] = ['product_name' => $product_name, 'price_id' => $price->id, 'amount_str' => $amount_str . ' / ' . esc_html($interval_str)];
                                 }
                                 \Stripe\Stripe::setApiKey(null);
                             } catch (\Exception $e) {
@@ -810,7 +832,6 @@ class EdelStripePaymentAdmin {
                                         <th>プラン名</th>
                                         <th>価格ID (plan_id)</th>
                                         <th>金額/期間</th>
-                                        <th>トライアル</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -995,6 +1016,64 @@ class EdelStripePaymentAdmin {
                                     プラグインを一時的に「停止」するだけではデータは削除されません。通常はこのオプションを有効にする必要はありません。<br>
                                     <span style="color: red;">※ユーザーメタ情報（Stripe顧客ID、サブスクID/ステータス）は、このオプションを有効にしても削除されません。</span>
                                 </p>
+                            </td>
+                        </tr>
+                    </table>
+                </div>
+
+                <div id="tab-login" class="tab-content">
+                    <h2>カスタムログインフォーム設定</h2>
+                    <p>ショートコード <code>[edel_stripe_login]</code> で表示されるカスタムログインフォームに関する設定です。</p>
+                    <table class="form-table">
+                        <tr>
+                            <th><label for="login_redirect_page_id">ログイン後のリダイレクト先</label></th>
+                            <td>
+                                <?php wp_dropdown_pages([
+                                    'name' => 'login_redirect_page_id',
+                                    'id' => 'login_redirect_page_id',
+                                    'show_option_none' => '— マイアカウント (デフォルト) —', // Default to WP dashboard or maybe My Account page?
+                                    'option_none_value' => '0',
+                                    'selected' => $login_redirect_page_id,
+                                    'post_status' => 'publish'
+                                ]); ?>
+                                <p class="description">カスタムログインフォームからログイン成功後、リダイレクトさせたい固定ページを選択します。未選択の場合はWordPressのデフォルト（通常ダッシュボード）にリダイレクトされます。</p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><label for="my_account_page_id">マイアカウントページ</label></th>
+                            <td>
+                                <?php wp_dropdown_pages([
+                                    'name' => 'my_account_page_id',
+                                    'id' => 'my_account_page_id',
+                                    'show_option_none' => '— 指定しない —',
+                                    'option_none_value' => '0',
+                                    'selected' => $my_account_page_id,
+                                    'post_status' => 'publish'
+                                ]); ?>
+                                <p class="description"><code>[edel_stripe_my_account]</code> ショートコードを設置したページを選択してください。管理者以外のユーザーがWordPress標準ログイン画面からログインした際のリダイレクト先になります。</p>
+                            </td>
+                        </tr>
+                    </table>
+                    <hr>
+                    <h2>reCAPTCHA v3 設定</h2>
+                    <p><a href="https://www.google.com/recaptcha/admin/create" target="_blank">Google reCAPTCHA v3</a> でサイトを登録し、サイトキーとシークレットキーを取得してください。</p>
+                    <table class="form-table">
+                        <tr>
+                            <th><label for="login_enable_recaptcha">reCAPTCHA v3 を有効化</label></th>
+                            <td><label><input type="checkbox" id="login_enable_recaptcha" name="login_enable_recaptcha" value="1" <?php checked($login_enable_recaptcha, '1'); ?>> カスタムログインフォームでreCAPTCHA v3を使用する</label></td>
+                        </tr>
+                        <tr>
+                            <th><label for="login_recaptcha_site_key">サイトキー (Site Key)</label></th>
+                            <td><input type="text" id="login_recaptcha_site_key" name="login_recaptcha_site_key" value="<?php echo esc_attr($login_recaptcha_site_key); ?>" class="regular-text"></td>
+                        </tr>
+                        <tr>
+                            <th><label for="login_recaptcha_secret_key">シークレットキー (Secret Key)</label></th>
+                            <td><input type="password" id="login_recaptcha_secret_key" name="login_recaptcha_secret_key" value="<?php echo esc_attr($login_recaptcha_secret_key); ?>" class="regular-text"></td>
+                        </tr>
+                        <tr>
+                            <th><label for="login_recaptcha_threshold">合格スコアしきい値</label></th>
+                            <td><input type="number" step="0.1" min="0.0" max="1.0" id="login_recaptcha_threshold" name="login_recaptcha_threshold" value="<?php echo esc_attr($login_recaptcha_threshold); ?>" class="small-text">
+                                <p class="description">reCAPTCHA v3 が返すスコア (0.0〜1.0、1.0が人間らしい) がこの値以上であればログインを許可します。通常は <code>0.5</code> が推奨されます。</p>
                             </td>
                         </tr>
                     </table>
